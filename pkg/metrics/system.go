@@ -277,31 +277,37 @@ func (m *SystemMetrics) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	if stats.Io != nil && len(stats.Io.Usage) > 0 {
+		var totalRbytes, totalWbytes, totalRios, totalWios float64
 		for _, entry := range stats.Io.Usage {
 			if entry == nil {
 				continue
 			}
-			ch <- prometheus.MustNewConstMetric(
-				m.ioReadBytes,
-				prometheus.CounterValue,
-				float64(entry.Rbytes),
-			)
-			ch <- prometheus.MustNewConstMetric(
-				m.ioWriteBytes,
-				prometheus.CounterValue,
-				float64(entry.Wbytes),
-			)
-			ch <- prometheus.MustNewConstMetric(
-				m.ioReadOperations,
-				prometheus.CounterValue,
-				float64(entry.Rios),
-			)
-			ch <- prometheus.MustNewConstMetric(
-				m.ioWriteOperations,
-				prometheus.CounterValue,
-				float64(entry.Wios),
-			)
+			totalRbytes += float64(entry.Rbytes)
+			totalWbytes += float64(entry.Wbytes)
+			totalRios += float64(entry.Rios)
+			totalWios += float64(entry.Wios)
 		}
+		
+		ch <- prometheus.MustNewConstMetric(
+			m.ioReadBytes,
+			prometheus.CounterValue,
+			totalRbytes,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			m.ioWriteBytes,
+			prometheus.CounterValue,
+			totalWbytes,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			m.ioReadOperations,
+			prometheus.CounterValue,
+			totalRios,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			m.ioWriteOperations,
+			prometheus.CounterValue,
+			totalWios,
+		)
 	}
 
 	usage, err := m.networkMonitor.GetUsage()
