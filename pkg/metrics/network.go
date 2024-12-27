@@ -2,7 +2,7 @@ package metrics
 
 import (
 	"bufio"
-	"log"
+	"go.lumeweb.com/akash-metrics-exporter/pkg/logger"
 	"os"
 	"strconv"
 	"strings"
@@ -25,7 +25,7 @@ func getNetworkStats() ([]NetStats, error) {
 	defer func(file *os.File) {
 		err := file.Close()
 		if err != nil {
-			log.Printf("Error closing file: %v", err)
+			logger.Log.Errorf("Error closing file: %v", err)
 		}
 	}(file)
 

@@ -7,7 +7,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.lumeweb.com/akash-metrics-exporter/pkg/metrics"
 	etcdregistry "go.lumeweb.com/etcd-registry"
-	"log"
+	"go.lumeweb.com/akash-metrics-exporter/pkg/logger"
 	"net/http"
 	"os"
 	"os/signal"
@@ -44,7 +44,7 @@ func NewApp() *App {
 func (a *App) setupEtcd() error {
 	etcdEndpoints := os.Getenv("ETCD_ENDPOINTS")
 	if etcdEndpoints == "" {
-		log.Println("ETCD support is disabled")
+		logger.Log.Info("ETCD support is disabled")
 		return nil
 	}
 
@@ -72,14 +72,14 @@ func (a *App) startRegistration(serviceName string, node etcdregistry.Node) erro
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
-		defer log.Println("Registration goroutine stopped")
+		defer logger.Log.Info("Registration goroutine stopped")
 
 		// Wait for initial registration
 		select {
 		case <-done:
-			log.Println("Initial registration complete")
+			logger.Log.Info("Initial registration complete")
 		case err := <-errChan:
-			log.Printf("Initial registration error: %v", err)
+			logger.Log.Errorf("Initial registration error: %v", err)
 		case <-a.ctx.Done():
 			return
 		}
@@ -91,7 +91,7 @@ func (a *App) startRegistration(serviceName string, node etcdregistry.Node) erro
 				if !ok {
 					return
 				}
-				log.Printf("Registration error: %v", err)
+				logger.Log.Errorf("Registration error: %v", err)
 			case <-a.ctx.Done():
 				return
 			}
@@ -120,9 +120,9 @@ func (a *App) setupHTTP(metricsPassword string) error {
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
-		log.Printf("Starting server on port %s", metricsPort)
+		logger.Log.Infof("Starting server on port %s", metricsPort)
 		if err := a.httpServer.ListenAndServe(); err != http.ErrServerClosed {
-			log.Printf("HTTP server error: %v", err)
+			logger.Log.Errorf("HTTP server error: %v", err)
 		}
 	}()
 
@@ -130,7 +130,7 @@ func (a *App) setupHTTP(metricsPassword string) error {
 }
 
 func (a *App) shutdown() {
-	log.Println("Starting graceful shutdown")
+	logger.Log.Info("Starting graceful shutdown")
 
 	// Cancel context to stop registration
 	a.cancel()
@@ -142,20 +142,20 @@ func (a *App) shutdown() {
 	// Shutdown HTTP server
 	if a.httpServer != nil {
 		if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
-			log.Printf("HTTP server shutdown error: %v", err)
+			logger.Log.Errorf("HTTP server shutdown error: %v", err)
 		}
 	}
 
 	// Close etcd registry
 	if a.registry != nil {
 		if err := a.registry.Close(); err != nil {
-			log.Printf("Error closing etcd registry: %v", err)
+			logger.Log.Errorf("Error closing etcd registry: %v", err)
 		}
 	}
 
 	// Wait for all goroutines
 	a.wg.Wait()
-	log.Println("Shutdown complete")
+	logger.Log.Info("Shutdown complete")
 }
 
 func main() {
@@ -168,12 +168,12 @@ func main() {
 	// Validate required env vars
 	metricsPassword := os.Getenv("METRICS_PASSWORD")
 	if metricsPassword == "" {
-		log.Fatal("METRICS_PASSWORD environment variable must be set")
+		logger.Log.Fatal("METRICS_PASSWORD environment variable must be set")
 	}
 
 	// Setup etcd if enabled
 	if err := app.setupEtcd(); err != nil {
-		log.Fatal(err)
+		logger.Log.Fatal(err)
 	}
 
 	// Configure Prometheus metrics
@@ -182,14 +182,14 @@ func main() {
 
 	// Start HTTP server
 	if err := app.setupHTTP(metricsPassword); err != nil {
-		log.Fatal(err)
+		logger.Log.Fatal(err)
 	}
 
 	// Start registration if etcd is enabled
 	if app.registry != nil {
 		serviceName := os.Getenv("METRICS_SERVICE_NAME")
 		if serviceName == "" {
-			log.Fatal("METRICS_SERVICE_NAME environment variable must be set")
+			logger.Log.Fatal("METRICS_SERVICE_NAME environment variable must be set")
 		}
 
 		metricsPort := os.Getenv("METRICS_PORT")
@@ -201,7 +201,7 @@ func main() {
 		registrationPort := metricsPort
 		akashPortVar := fmt.Sprintf("AKASH_EXTERNAL_PORT_%s", metricsPort)
 		if akashPort := os.Getenv(akashPortVar); akashPort != "" {
-			log.Printf("Found Akash external port mapping: %s - will use for etcd registration", akashPort)
+			logger.Log.Infof("Found Akash external port mapping: %s - will use for etcd registration", akashPort)
 			registrationPort = akashPort
 		}
 
@@ -218,7 +218,7 @@ func main() {
 		}
 
 		if err := app.startRegistration(serviceName, node); err != nil {
-			log.Fatal(err)
+			logger.Log.Fatal(err)
 		}
 	}
 

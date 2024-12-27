@@ -6,7 +6,7 @@ import (
 	"github.com/containerd/cgroups/v3/cgroup2"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.lumeweb.com/akash-metrics-exporter/pkg/metrics/validation"
-	"log"
+	"go.lumeweb.com/akash-metrics-exporter/pkg/logger"
 	"os"
 	"strconv"
 	"strings"
@@ -167,28 +167,28 @@ func (m *SystemMetrics) Collect(ch chan<- prometheus.Metric) {
 	// Validate cgroups setup with fallback strategies
 	_validation := validation.ValidateCgroups()
 	if !_validation.Available {
-		log.Printf("Cgroups validation failed:")
+		logger.Log.Warn("Cgroups validation failed:")
 		for _, err := range _validation.Errors {
-			log.Printf("  - %s", err)
+			logger.Log.Warnf("  - %s", err)
 		}
-		log.Printf("Cgroups stats:")
+		logger.Log.Info("Cgroups stats:")
 		for k, v := range _validation.Stats {
-			log.Printf("  %s: %s", k, v)
+			logger.Log.Infof("  %s: %s", k, v)
 		}
 
 		// Check permissions and mount points
-		log.Printf("Permissions:")
+		logger.Log.Info("Permissions:")
 		for k, v := range _validation.Permissions {
-			log.Printf("  %s: %v", k, v)
+			logger.Log.Infof("  %s: %v", k, v)
 		}
-		log.Printf("Mount points:")
+		logger.Log.Info("Mount points:")
 		for k, v := range _validation.MountPoints {
-			log.Printf("  %s: %s", k, v)
+			logger.Log.Infof("  %s: %s", k, v)
 		}
 
 		// Try alternative metric sources if cgroups unavailable
 		if _validation.Version == 0 {
-			log.Printf("Attempting to read metrics from /proc filesystem")
+			logger.Log.Info("Attempting to read metrics from /proc filesystem")
 			if stats, err := readProcStats(); err == nil {
 				// Use proc stats as fallback
 				ch <- prometheus.MustNewConstMetric(
@@ -202,18 +202,18 @@ func (m *SystemMetrics) Collect(ch chan<- prometheus.Metric) {
 					float64(stats.MemoryUsage),
 				)
 			} else {
-				log.Printf("Failed to read proc stats: %v", err)
+				logger.Log.Errorf("Failed to read proc stats: %v", err)
 			}
 		}
 	}
 
 	// Load cgroup controller with proper path and error handling
-	log.Printf("Loading cgroup2 controller")
-
+	logger.Log.Debug("Loading cgroup2 controller")
+	
 	// Get current cgroup path from /proc/self/cgroup
 	selfCgroup, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
-		log.Printf("Error reading /proc/self/cgroup: %v", err)
+		logger.Log.Errorf("Error reading /proc/self/cgroup: %v", err)
 		return
 	}
 
@@ -226,44 +226,44 @@ func (m *SystemMetrics) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	log.Printf("Using cgroup path: %s", cgroupPath)
+	logger.Log.Debugf("Using cgroup path: %s", cgroupPath)
 	cg, err := cgroup2.Load(cgroupPath, cgroup2.WithMountpoint("/sys/fs/cgroup"))
 	if err != nil {
-		log.Printf("Error loading cgroup: %v", err)
+		logger.Log.Errorf("Error loading cgroup: %v", err)
 		return
 	}
 
 	if cg == nil {
-		log.Printf("Cgroup controller is nil after loading")
+		logger.Log.Warn("Cgroup controller is nil after loading")
 		return
 	}
 
-	log.Printf("Successfully loaded cgroup controller")
+	logger.Log.Debug("Successfully loaded cgroup controller")
 	stats, err := cg.Stat()
 	if err != nil {
-		log.Printf("Error getting cgroup stats: %v", err)
+		logger.Log.Errorf("Error getting cgroup stats: %v", err)
 		return
 	}
 
 	if stats == nil {
-		log.Printf("Cgroup stats are nil")
+		logger.Log.Warn("Cgroup stats are nil")
 		return
 	}
 
-	log.Printf("Got cgroup stats: CPU=%v, Memory=%v, IO=%v",
+	logger.Log.Debugf("Got cgroup stats: CPU=%v, Memory=%v, IO=%v",
 		stats.CPU != nil,
 		stats.Memory != nil,
 		stats.Io != nil)
 
 	if stats.CPU != nil {
-		log.Printf("Library CPU usage: %d usec", stats.CPU.UsageUsec)
+		logger.Log.Debugf("Library CPU usage: %d usec", stats.CPU.UsageUsec)
 		ch <- prometheus.MustNewConstMetric(
 			m.cpuUsage,
 			prometheus.GaugeValue,
 			float64(stats.CPU.UsageUsec),
 		)
 	} else {
-		log.Printf("CPU stats are nil")
+		logger.Log.Debug("CPU stats are nil")
 	}
 
 	if stats.Memory != nil {
@@ -273,7 +273,7 @@ func (m *SystemMetrics) Collect(ch chan<- prometheus.Metric) {
 			float64(stats.Memory.Usage),
 		)
 	} else {
-		log.Printf("Memory stats are nil")
+		logger.Log.Debug("Memory stats are nil")
 	}
 
 	if stats.Io != nil && len(stats.Io.Usage) > 0 {
@@ -306,7 +306,7 @@ func (m *SystemMetrics) Collect(ch chan<- prometheus.Metric) {
 
 	usage, err := m.networkMonitor.GetUsage()
 	if err != nil {
-		log.Printf("Error getting network usage: %v", err)
+		logger.Log.Errorf("Error getting network usage: %v", err)
 		return
 	}
 
