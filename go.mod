@@ -6,7 +6,7 @@ require (
 	github.com/containerd/cgroups/v3 v3.0.5
 	github.com/prometheus/client_golang v1.20.5
 	github.com/stretchr/testify v1.10.0
-	go.lumeweb.com/etcd-registry v0.0.0-20241227073645-b5d1d73f925f
+	go.lumeweb.com/etcd-registry v0.0.0-20241227075158-5912e72e1c93
 )
 
 require (
