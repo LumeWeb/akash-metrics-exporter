@@ -207,104 +207,133 @@ func (m *SystemMetrics) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	// Load cgroup controller
-	log.Printf("Loading cgroup2 controller from /sys/fs/cgroup")
-	cg, err := cgroup2.Load("/sys/fs/cgroup", nil)
+	// Load cgroup controller with proper path and error handling
+	log.Printf("Loading cgroup2 controller")
+
+	// Get current cgroup path from /proc/self/cgroup
+	selfCgroup, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		log.Printf("Error reading /proc/self/cgroup: %v", err)
+		return
+	}
+
+	// Parse cgroup path, default to "/" if parsing fails
+	cgroupPath := "/"
+	if len(selfCgroup) > 0 {
+		parts := strings.Split(strings.TrimSpace(string(selfCgroup)), ":")
+		if len(parts) == 3 && len(parts[2]) > 0 {
+			cgroupPath = parts[2]
+		}
+	}
+
+	log.Printf("Using cgroup path: %s", cgroupPath)
+	cg, err := cgroup2.Load(cgroupPath, cgroup2.WithMountpoint("/sys/fs/cgroup"))
 	if err != nil {
 		log.Printf("Error loading cgroup: %v", err)
-		// Don't return - continue with other metrics
+		return
+	}
+
+	if cg == nil {
+		log.Printf("Cgroup controller is nil after loading")
+		return
+	}
+
+	log.Printf("Successfully loaded cgroup controller")
+	stats, err := cg.Stat()
+	if err != nil {
+		log.Printf("Error getting cgroup stats: %v", err)
+		return
+	}
+
+	if stats == nil {
+		log.Printf("Cgroup stats are nil")
+		return
+	}
+
+	log.Printf("Got cgroup stats: CPU=%v, Memory=%v, IO=%v",
+		stats.CPU != nil,
+		stats.Memory != nil,
+		stats.Io != nil)
+
+	if stats.CPU != nil {
+		log.Printf("Library CPU usage: %d usec", stats.CPU.UsageUsec)
+		ch <- prometheus.MustNewConstMetric(
+			m.cpuUsage,
+			prometheus.GaugeValue,
+			float64(stats.CPU.UsageUsec),
+		)
 	} else {
-		log.Printf("Successfully loaded cgroup controller")
-		stats, err := cg.Stat()
-		if err != nil {
-			log.Printf("Error getting cgroup stats: %v", err)
-		} else {
-			log.Printf("Got cgroup stats: CPU=%v, Memory=%v, IO=%v",
-				stats != nil && stats.CPU != nil,
-				stats != nil && stats.Memory != nil,
-				stats != nil && stats.Io != nil)
+		log.Printf("CPU stats are nil")
+	}
 
-			// Validate CPU stats against raw file
-			if rawCPU, ok := _validation.Stats["cpu.stat"]; ok {
-				if parsedUsage, err := validation.ParseCPUStat(rawCPU); err == nil {
-					log.Printf("Raw CPU usage: %d usec", parsedUsage)
-				}
-			}
+	if stats.Memory != nil {
+		ch <- prometheus.MustNewConstMetric(
+			m.memUsage,
+			prometheus.GaugeValue,
+			float64(stats.Memory.Usage),
+		)
+	} else {
+		log.Printf("Memory stats are nil")
+	}
 
-			if stats != nil && stats.CPU != nil {
-				log.Printf("Library CPU usage: %d usec", stats.CPU.UsageUsec)
-				ch <- prometheus.MustNewConstMetric(
-					m.cpuUsage,
-					prometheus.GaugeValue,
-					float64(stats.CPU.UsageUsec),
-				)
+	if stats.Io != nil && len(stats.Io.Usage) > 0 {
+		for _, entry := range stats.Io.Usage {
+			if entry == nil {
+				continue
 			}
-
-			if stats != nil && stats.Memory != nil {
-				ch <- prometheus.MustNewConstMetric(
-					m.memUsage,
-					prometheus.GaugeValue,
-					float64(stats.Memory.Usage),
-				)
-			}
-
-			if stats != nil && stats.Io != nil {
-				for _, entry := range stats.Io.Usage {
-					ch <- prometheus.MustNewConstMetric(
-						m.ioReadBytes,
-						prometheus.CounterValue,
-						float64(entry.Rbytes),
-					)
-					ch <- prometheus.MustNewConstMetric(
-						m.ioWriteBytes,
-						prometheus.CounterValue,
-						float64(entry.Wbytes),
-					)
-					ch <- prometheus.MustNewConstMetric(
-						m.ioReadOperations,
-						prometheus.CounterValue,
-						float64(entry.Rios),
-					)
-					ch <- prometheus.MustNewConstMetric(
-						m.ioWriteOperations,
-						prometheus.CounterValue,
-						float64(entry.Wios),
-					)
-				}
-			}
-
-			usage, err := m.networkMonitor.GetUsage()
-			if err != nil {
-				log.Printf("Error getting network usage: %v", err)
-				return
-			}
-
-			for _, u := range usage {
-				ch <- prometheus.MustNewConstMetric(
-					m.rxBytesPerSec,
-					prometheus.GaugeValue,
-					u.RxBytesPerSec,
-					u.Interface,
-				)
-				ch <- prometheus.MustNewConstMetric(
-					m.txBytesPerSec,
-					prometheus.GaugeValue,
-					u.TxBytesPerSec,
-					u.Interface,
-				)
-				ch <- prometheus.MustNewConstMetric(
-					m.rxPacketsPerSec,
-					prometheus.GaugeValue,
-					u.RxPacketsPerSec,
-					u.Interface,
-				)
-				ch <- prometheus.MustNewConstMetric(
-					m.txPacketsPerSec,
-					prometheus.GaugeValue,
-					u.TxPacketsPerSec,
-					u.Interface,
-				)
-			}
+			ch <- prometheus.MustNewConstMetric(
+				m.ioReadBytes,
+				prometheus.CounterValue,
+				float64(entry.Rbytes),
+			)
+			ch <- prometheus.MustNewConstMetric(
+				m.ioWriteBytes,
+				prometheus.CounterValue,
+				float64(entry.Wbytes),
+			)
+			ch <- prometheus.MustNewConstMetric(
+				m.ioReadOperations,
+				prometheus.CounterValue,
+				float64(entry.Rios),
+			)
+			ch <- prometheus.MustNewConstMetric(
+				m.ioWriteOperations,
+				prometheus.CounterValue,
+				float64(entry.Wios),
+			)
 		}
+	}
+
+	usage, err := m.networkMonitor.GetUsage()
+	if err != nil {
+		log.Printf("Error getting network usage: %v", err)
+		return
+	}
+
+	for _, u := range usage {
+		ch <- prometheus.MustNewConstMetric(
+			m.rxBytesPerSec,
+			prometheus.GaugeValue,
+			u.RxBytesPerSec,
+			u.Interface,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			m.txBytesPerSec,
+			prometheus.GaugeValue,
+			u.TxBytesPerSec,
+			u.Interface,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			m.rxPacketsPerSec,
+			prometheus.GaugeValue,
+			u.RxPacketsPerSec,
+			u.Interface,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			m.txPacketsPerSec,
+			prometheus.GaugeValue,
+			u.TxPacketsPerSec,
+			u.Interface,
+		)
 	}
 }
