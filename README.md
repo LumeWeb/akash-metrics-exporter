@@ -40,6 +40,7 @@ A Prometheus metrics exporter designed for Akash Network nodes that provides com
 - **Status**: `node_registration_status` - Current registration status (0=down, 1=up)
 - **Errors**: `node_registration_errors_total` - Total number of registration errors
 - **Last Success**: `node_last_registration_timestamp` - Unix timestamp of last successful registration
+- **Deployment Info**: `node_deployment_info` - Node deployment information with hash_id and deployment_id labels
 
 ## Configuration
 
@@ -51,6 +52,7 @@ A Prometheus metrics exporter designed for Akash Network nodes that provides com
 - `METRICS_PORT` - Port for the metrics endpoint to listen on (default: 8080)
 - `AKASH_EXTERNAL_PORT_X` - Optional Akash deployment port mapping (where X matches your METRICS_PORT value)
 - `AKASH_INGRESS_HOST` - Akash ingress hostname (used for node identification)
+- `AKASH_DEPLOYMENT_SEQUENCE` - Akash blockchain deployment ID
 - `METRICS_PASSWORD` - Required password for basic auth protection of metrics endpoint
 - `METRICS_SERVICE_NAME` - Required service name for registration with etcd
 

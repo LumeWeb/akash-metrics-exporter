@@ -36,6 +36,7 @@ const (
 	metricRegistrationStatus = "node_registration_status"
 	metricRegistrationErrors = "node_registration_errors_total"
 	metricLastRegistration   = "node_last_registration_timestamp"
+	metricDeploymentInfo    = "node_deployment_info"
 
 	// Node status constants
 	StatusStarting = "starting"
@@ -56,9 +57,10 @@ type App struct {
 	regErrChan  <-chan error
 
 	// Metrics
-	regStatus   prometheus.Gauge
-	regErrors   prometheus.Counter
-	lastRegTime prometheus.Gauge
+	regStatus      prometheus.Gauge
+	regErrors      prometheus.Counter
+	lastRegTime    prometheus.Gauge
+	deploymentInfo *prometheus.GaugeVec
 
 	// Rate limiting
 	etcdLimiter *rate.Limiter
@@ -85,12 +87,20 @@ func NewApp() *App {
 			Name: metricLastRegistration,
 			Help: "Timestamp of last successful registration",
 		}),
+		deploymentInfo: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: metricDeploymentInfo,
+				Help: "Node deployment information",
+			},
+			[]string{"hash_id", "deployment_id"},
+		),
 	}
 
 	// Register metrics
 	prometheus.MustRegister(app.regStatus)
 	prometheus.MustRegister(app.regErrors)
 	prometheus.MustRegister(app.lastRegTime)
+	prometheus.MustRegister(app.deploymentInfo)
 
 	return app
 }
@@ -132,7 +142,7 @@ func (a *App) setupEtcd() error {
 
 func (a *App) validateNodeInfo(node types.Node) error {
 	if node.ID == "" {
-		return fmt.Errorf("node ID is required")
+		return fmt.Errorf("node ID (hash) is required")
 	}
 	if node.ExporterType == "" {
 		return fmt.Errorf("exporter type is required")
@@ -142,6 +152,14 @@ func (a *App) validateNodeInfo(node types.Node) error {
 	}
 	if node.MetricsPath == "" {
 		return fmt.Errorf("metrics path is required")
+	}
+
+	// Optional deployment ID validation
+	if deploymentID, exists := node.Labels["deployment_id"]; exists && deploymentID != "" {
+		// Basic format validation - can be enhanced based on actual format requirements
+		if len(deploymentID) < 1 {
+			return fmt.Errorf("invalid deployment ID format")
+		}
 	}
 
 	return nil
@@ -486,20 +504,30 @@ func runApp() error {
 		akashIngressHost := os.Getenv("AKASH_INGRESS_HOST")
 		address := fmt.Sprintf("http://%s:%s/metrics", akashIngressHost, registrationPort)
 
+		identifiers := getNodeIdentifiers(akashIngressHost)
+		
 		node := types.Node{
-			ID:           getSelfNodeName(akashIngressHost),
+			ID:           identifiers.HashID,
 			ExporterType: "node_exporter",
 			Port:         mustParseInt(registrationPort),
 			MetricsPath:  "/metrics",
 			Labels: map[string]string{
-				"password":   metricsPassword,
-				"address":    address,
-				"version":    build.Version,
-				"git_commit": build.GitCommit,
+				"password":      metricsPassword,
+				"address":       address,
+				"version":       build.Version,
+				"git_commit":    build.GitCommit,
+				"deployment_id": identifiers.DeploymentID,
+				"hash_id":      identifiers.HashID,
 			},
 			Status:   StatusStarting,
 			LastSeen: time.Now(),
 		}
+
+		// Set deployment info metric
+		app.deploymentInfo.With(prometheus.Labels{
+			"hash_id":       identifiers.HashID,
+			"deployment_id": identifiers.DeploymentID,
+		}).Set(1)
 
 		if err := app.startRegistration(serviceName, node); err != nil {
 			return fmt.Errorf("registration failed: %w", err)
@@ -532,7 +560,22 @@ func mustParseInt(s string) int {
 	return i
 }
 
-func getSelfNodeName(host string) string {
+type NodeIdentifiers struct {
+	HashID       string // From ingress hostname
+	DeploymentID string // From AKASH_DEPLOYMENT_SEQUENCE
+}
+
+func getNodeIdentifiers(host string) NodeIdentifiers {
+	hashID := extractHashFromHost(host)
+	deploymentID := os.Getenv("AKASH_DEPLOYMENT_SEQUENCE")
+
+	return NodeIdentifiers{
+		HashID:       hashID,
+		DeploymentID: deploymentID,
+	}
+}
+
+func extractHashFromHost(host string) string {
 	parts := strings.Split(host, ".")
 	if len(parts) > 0 {
 		return parts[0]
