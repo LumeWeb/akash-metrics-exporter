@@ -407,30 +407,43 @@ func (a *App) setupHTTP(metricsPassword string) error {
 func (a *App) shutdown() {
 	logger.Log.Info("Starting graceful shutdown")
 
-	// Cancel context to stop registration
+	// Cancel context to stop registration and health checks
 	if a.cancel != nil {
 		a.cancel()
+		logger.Log.Debug("Cancelled context")
 	}
 
 	// Create shutdown context
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
 
-	// Shutdown HTTP server
+	// Shutdown HTTP server first
 	if a.httpServer != nil {
+		logger.Log.Debug("Shutting down HTTP server")
 		if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
 			logger.Log.Errorf("HTTP server shutdown error: %v", err)
+		} else {
+			logger.Log.Debug("HTTP server shutdown complete")
 		}
 	}
 
-	// Close etcd registry
+	// Close etcd registry with lease handling
 	if a.registry != nil {
+		logger.Log.Debug("Closing etcd registry")
+		// Ignore lease not found errors during shutdown
 		if err := a.registry.Close(); err != nil {
-			logger.Log.Errorf("Error closing etcd registry: %v", err)
+			if strings.Contains(err.Error(), "requested lease not found") {
+				logger.Log.Debug("Ignoring lease not found error during shutdown")
+			} else {
+				logger.Log.Errorf("Error closing etcd registry: %v", err)
+			}
+		} else {
+			logger.Log.Debug("Etcd registry closed successfully")
 		}
 	}
 
 	// Wait for all goroutines with timeout
+	logger.Log.Debug("Waiting for goroutines to complete")
 	done := make(chan struct{})
 	go func() {
 		a.wg.Wait()
