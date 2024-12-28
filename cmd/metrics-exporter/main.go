@@ -513,7 +513,6 @@ func runApp() error {
 			Port:         mustParseInt(registrationPort),
 			MetricsPath:  "/metrics",
 			Labels: map[string]string{
-				"password":      metricsPassword,
 				"address":       address,
 				"version":       build.Version,
 				"git_commit":    build.GitCommit,
