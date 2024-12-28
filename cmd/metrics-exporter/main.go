@@ -66,15 +66,17 @@ func (a *App) setupEtcd() error {
 }
 
 func (a *App) validateNodeInfo(node etcdregistry.Node) error {
-	if node.Name == "" {
-		return fmt.Errorf("node name is required")
+	if node.ID == "" {
+		return fmt.Errorf("node ID is required")
 	}
-	
-	required := []string{"port", "address", "password"}
-	for _, field := range required {
-		if _, ok := node.Info[field]; !ok {
-			return fmt.Errorf("missing required node info field: %s", field)
-		}
+	if node.ExporterType == "" {
+		return fmt.Errorf("exporter type is required") 
+	}
+	if node.Port <= 0 {
+		return fmt.Errorf("port must be > 0")
+	}
+	if node.MetricsPath == "" {
+		return fmt.Errorf("metrics path is required")
 	}
 	
 	return nil
@@ -279,12 +281,15 @@ func main() {
 		address := fmt.Sprintf("http://%s:%s/metrics", akashIngressHost, registrationPort)
 
 		node := etcdregistry.Node{
-			Name: getSelfNodeName(akashIngressHost),
-			Info: map[string]string{
-				"port":     registrationPort,
-				"address":  address,
+			ID:           getSelfNodeName(akashIngressHost),
+			ExporterType: "akash",
+			Port:         mustParseInt(registrationPort),
+			MetricsPath:  "/metrics",
+			Labels: map[string]string{
 				"password": metricsPassword,
+				"address":  address,
 			},
+			Status: "healthy",
 		}
 
 		if err := app.startRegistration(serviceName, node); err != nil {
@@ -307,6 +312,15 @@ func basicAuthMiddleware(password string, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// Add helper function for port parsing
+func mustParseInt(s string) int {
+	i, err := strconv.Atoi(s)
+	if err != nil {
+		logger.Log.Fatalf("Failed to parse port number: %v", err)
+	}
+	return i
 }
 
 func getSelfNodeName(host string) string {
