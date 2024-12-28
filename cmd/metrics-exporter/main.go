@@ -256,18 +256,28 @@ func (a *App) startHealthCheck() {
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
-		ticker := time.NewTicker(healthCheckInterval)
-		defer ticker.Stop()
 
+		// Monitor the registration channels
 		for {
 			select {
-			case <-ticker.C:
+			case <-a.regDone:
+				// Registration expired/completed, need to re-register
 				if err := a.registerNode(a.ctx, a.currentNode); err != nil {
-					logger.Log.Errorf("Health check failed: %v", err)
+					logger.Log.Errorf("Re-registration failed: %v", err)
 					a.regStatus.Set(0)
+					a.regErrors.Inc()
 				} else {
 					a.regStatus.Set(1)
 					a.lastRegTime.Set(float64(time.Now().Unix()))
+				}
+			case err := <-a.regErrChan:
+				logger.Log.Errorf("Registration error: %v", err)
+				a.regStatus.Set(0)
+				a.regErrors.Inc()
+				// Attempt to re-register after error with backoff
+				time.Sleep(5 * time.Second)
+				if err := a.registerNode(a.ctx, a.currentNode); err != nil {
+					logger.Log.Errorf("Re-registration failed: %v", err)
 				}
 			case <-a.ctx.Done():
 				return
