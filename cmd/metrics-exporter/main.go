@@ -7,10 +7,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.lumeweb.com/akash-metrics-exporter/pkg/metrics"
 	etcdregistry "go.lumeweb.com/etcd-registry"
+	"go.lumeweb.com/etcd-registry/types"
 	"go.lumeweb.com/akash-metrics-exporter/pkg/logger"
+	"go.lumeweb.com/akash-metrics-exporter/pkg/build"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,24 +26,65 @@ const (
 	defaultEtcdTimeout = 30 * time.Second
 	registrationTTL    = 30 * time.Second
 	shutdownTimeout    = 10 * time.Second
+	healthCheckInterval = registrationTTL / 2
+
+	// Metric names
+	metricRegistrationStatus = "node_registration_status"
+	metricRegistrationErrors = "node_registration_errors_total"
+	metricLastRegistration   = "node_last_registration_timestamp"
+
+	// Node status constants
+	StatusStarting  = "starting"
+	StatusHealthy   = "healthy"
+	StatusDegraded  = "degraded"
+	StatusShutdown  = "shutdown"
 )
 
 type App struct {
 	registry    *etcdregistry.EtcdRegistry
+	group       *types.ServiceGroup
+	currentNode types.Node
 	httpServer  *http.Server
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
 	regDone     <-chan struct{}
 	regErrChan  <-chan error
+
+	// Metrics
+	regStatus      prometheus.Gauge
+	regErrors      prometheus.Counter
+	lastRegTime    prometheus.Gauge
 }
 
 func NewApp() *App {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &App{
+	
+	app := &App{
 		ctx:    ctx,
 		cancel: cancel,
+		
+		// Initialize metrics
+		regStatus: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: metricRegistrationStatus,
+			Help: "Current registration status (0=down, 1=up)",
+		}),
+		regErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: metricRegistrationErrors,
+			Help: "Total number of registration errors",
+		}),
+		lastRegTime: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: metricLastRegistration,
+			Help: "Timestamp of last successful registration",
+		}),
 	}
+
+	// Register metrics
+	prometheus.MustRegister(app.regStatus)
+	prometheus.MustRegister(app.regErrors)
+	prometheus.MustRegister(app.lastRegTime)
+
+	return app
 }
 
 func (a *App) setupEtcd() error {
@@ -57,6 +101,7 @@ func (a *App) setupEtcd() error {
 		os.Getenv("ETCD_USERNAME"),
 		os.Getenv("ETCD_PASSWORD"),
 		defaultEtcdTimeout,
+		3, // maxRetries for connection attempts
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create etcd registry: %w", err)
@@ -65,7 +110,7 @@ func (a *App) setupEtcd() error {
 	return nil
 }
 
-func (a *App) validateNodeInfo(node etcdregistry.Node) error {
+func (a *App) validateNodeInfo(node types.Node) error {
 	if node.ID == "" {
 		return fmt.Errorf("node ID is required")
 	}
@@ -82,59 +127,177 @@ func (a *App) validateNodeInfo(node etcdregistry.Node) error {
 	return nil
 }
 
-func (a *App) startRegistration(serviceName string, node etcdregistry.Node) error {
-	if err := a.validateNodeInfo(node); err != nil {
-		return fmt.Errorf("invalid node info: %w", err)
+func (a *App) validateStatus(status string) bool {
+	validStatuses := []string{
+		StatusStarting,
+		StatusHealthy,
+		StatusDegraded,
+		StatusShutdown,
+	}
+	for _, s := range validStatuses {
+		if s == status {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) updateNodeStatus(status string) error {
+	if a.group == nil {
+		return fmt.Errorf("no active service group")
 	}
 
-	// Create registration context with timeout
-	regCtx, regCancel := context.WithTimeout(a.ctx, defaultEtcdTimeout)
-	defer regCancel()
+	if !a.validateStatus(status) {
+		return fmt.Errorf("invalid status: %s", status)
+	}
+	
+	a.currentNode.Status = status
+	a.currentNode.LastSeen = time.Now()
 
-	done, errChan, err := a.registry.RegisterNode(regCtx, serviceName, node, registrationTTL)
+	// Update metrics based on status
+	if status == StatusHealthy {
+		a.regStatus.Set(1)
+		a.lastRegTime.Set(float64(time.Now().Unix()))
+	} else if status == StatusDegraded || status == StatusShutdown {
+		a.regStatus.Set(0)
+	}
+	
+	done, errChan, err := a.group.RegisterNode(a.ctx, a.currentNode, registrationTTL)
 	if err != nil {
-		return fmt.Errorf("failed to start registration: %w", err)
+		return fmt.Errorf("failed to update node status: %w", err)
 	}
-
-	// Store channels for cleanup
+	
 	a.regDone = done
 	a.regErrChan = errChan
+	return nil
+}
 
+func (a *App) startHealthCheck() {
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
-		defer logger.Log.Info("Registration goroutine stopped")
-
-		// Wait for initial registration with timeout
-		select {
-		case <-done:
-			logger.Log.Info("Initial registration complete")
-		case err := <-errChan:
-			logger.Log.Errorf("Initial registration error: %v", err)
-		case <-regCtx.Done():
-			logger.Log.Error("Initial registration timed out")
-			return
-		case <-a.ctx.Done():
-			return
-		}
-
-		// Monitor registration errors
+		ticker := time.NewTicker(healthCheckInterval)
+		defer ticker.Stop()
+		
 		for {
 			select {
-			case err, ok := <-errChan:
+			case <-ticker.C:
+				if err := a.updateNodeStatus(StatusHealthy); err != nil {
+					logger.Log.Errorf("Health check failed: %v", err)
+				}
+			case <-a.ctx.Done():
+				_ = a.updateNodeStatus(StatusShutdown)
+				return
+			}
+		}
+	}()
+}
+
+func (a *App) handleRegistrationFailure() error {
+	logger.Log.Warn("Attempting registration recovery")
+	
+	if err := a.setupEtcdGroup(a.currentNode.Labels["service"]); err != nil {
+		a.regErrors.Inc()
+		return fmt.Errorf("recovery failed - group setup: %w", err)
+	}
+	
+	a.currentNode.Status = StatusDegraded
+	done, errChan, err := a.group.RegisterNode(a.ctx, a.currentNode, registrationTTL)
+	if err != nil {
+		return fmt.Errorf("recovery failed - registration: %w", err)
+	}
+	
+	a.regDone = done
+	a.regErrChan = errChan
+	return nil
+}
+
+func (a *App) monitorRegistration() {
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		defer logger.Log.Info("Registration monitor stopped")
+
+		retryCount := 0
+		maxRetries := 3
+
+		for {
+			select {
+			case <-a.regDone:
+				logger.Log.Info("Registration successful")
+				retryCount = 0
+				
+			case err, ok := <-a.regErrChan:
 				if !ok {
-					logger.Log.Info("Registration error channel closed")
 					return
 				}
-				logger.Log.Errorf("Registration error: %v", err)
-			case <-done:
-				logger.Log.Info("Registration completed")
-				return
+				if err != nil {
+					retryCount++
+					a.regErrors.Inc()
+					logger.Log.Errorf("Registration error (attempt %d/%d): %v", 
+						retryCount, maxRetries, err)
+					
+					if retryCount >= maxRetries {
+						if err := a.handleRegistrationFailure(); err != nil {
+							logger.Log.Errorf("Recovery failed: %v", err)
+							return
+						}
+						retryCount = 0
+					}
+				}
+				
 			case <-a.ctx.Done():
 				return
 			}
 		}
 	}()
+}
+
+func (a *App) setupEtcdGroup(serviceName string) error {
+	group, err := a.registry.CreateOrJoinServiceGroup(a.ctx, serviceName)
+	if err != nil {
+		return fmt.Errorf("failed to create/join service group: %w", err)
+	}
+
+	spec := types.ServiceGroupSpec{
+		CommonLabels: map[string]string{
+			"exporter_type": "node_exporter",
+			"service":       serviceName,
+			"os":           runtime.GOOS,
+			"arch":         runtime.GOARCH,
+		},
+	}
+
+	if err := group.Configure(spec); err != nil {
+		return fmt.Errorf("failed to configure service group: %w", err)
+	}
+
+	a.group = group
+	return nil
+}
+
+func (a *App) startRegistration(serviceName string, node types.Node) error {
+	if err := a.validateNodeInfo(node); err != nil {
+		return fmt.Errorf("invalid node info: %w", err)
+	}
+
+	a.currentNode = node
+
+	if err := a.setupEtcdGroup(serviceName); err != nil {
+		return fmt.Errorf("failed to setup etcd group: %w", err)
+	}
+
+	done, errChan, err := a.group.RegisterNode(a.ctx, node, registrationTTL)
+	if err != nil {
+		return fmt.Errorf("failed to start registration: %w", err)
+	}
+
+	a.regDone = done
+	a.regErrChan = errChan
+
+	// Start monitoring and health checks
+	a.monitorRegistration()
+	a.startHealthCheck()
 
 	return nil
 }
@@ -184,40 +347,6 @@ func (a *App) shutdown() {
 		}
 	}
 
-	// Clean up registration
-	if a.regDone != nil || a.regErrChan != nil {
-		cleanupTimer := time.NewTimer(5 * time.Second)
-		defer cleanupTimer.Stop()
-
-		// Wait for registration to complete or timeout
-		if a.regDone != nil {
-			select {
-			case <-a.regDone:
-				logger.Log.Debug("Registration completed during shutdown")
-			case <-cleanupTimer.C:
-				logger.Log.Warn("Timeout waiting for registration completion")
-			}
-		}
-
-		// Drain error channel
-		if a.regErrChan != nil {
-			for {
-				select {
-				case err, ok := <-a.regErrChan:
-					if !ok {
-						logger.Log.Debug("Registration error channel closed")
-						goto cleanup
-					}
-					logger.Log.Debugf("Registration error during shutdown: %v", err)
-				case <-cleanupTimer.C:
-					logger.Log.Warn("Timeout draining registration error channel")
-					goto cleanup
-				}
-			}
-		}
-	}
-
-cleanup:
 	// Close etcd registry
 	if a.registry != nil {
 		if err := a.registry.Close(); err != nil {
@@ -280,16 +409,19 @@ func main() {
 		akashIngressHost := os.Getenv("AKASH_INGRESS_HOST")
 		address := fmt.Sprintf("http://%s:%s/metrics", akashIngressHost, registrationPort)
 
-		node := etcdregistry.Node{
+		node := types.Node{
 			ID:           getSelfNodeName(akashIngressHost),
-			ExporterType: "akash",
+			ExporterType: "node_exporter",
 			Port:         mustParseInt(registrationPort),
 			MetricsPath:  "/metrics",
 			Labels: map[string]string{
 				"password": metricsPassword,
 				"address":  address,
+				"version": build.Version,
+				"git_commit": build.GitCommit,
 			},
-			Status: "healthy",
+			Status: StatusStarting,
+			LastSeen: time.Now(),
 		}
 
 		if err := app.startRegistration(serviceName, node); err != nil {

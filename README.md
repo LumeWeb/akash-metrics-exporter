@@ -11,6 +11,8 @@ A Prometheus metrics exporter designed for Akash Network nodes that provides com
 - **Service Discovery**: Optional etcd integration for automatic service registration
 - **Container-Ready**: Full Docker support with automated builds
 - **Automatic Node Identification**: Extracts unique node IDs from Akash ingress hostnames
+- **Registration Health Monitoring**: Tracks node registration status and errors
+- **Version Tracking**: Built-in version information with Git commit tracking
 
 ## Metrics
 
@@ -33,6 +35,11 @@ A Prometheus metrics exporter designed for Akash Network nodes that provides com
 - **Transmit (TX)**:
   - `system_network_tx_bytes_per_second` - Outgoing bandwidth usage
   - `system_network_tx_packets_per_second` - Packet transmit rate
+
+### Registration Metrics
+- **Status**: `node_registration_status` - Current registration status (0=down, 1=up)
+- **Errors**: `node_registration_errors_total` - Total number of registration errors
+- **Last Success**: `node_last_registration_timestamp` - Unix timestamp of last successful registration
 
 ## Configuration
 
@@ -59,8 +66,10 @@ When etcd integration is enabled, the following information is registered:
 - Full metrics endpoint URL (constructed from ingress host and port)
 - Basic auth password (for automated service discovery)
 - Port configuration (internal and external mappings)
+- Version information (version, git commit hash)
+- Build details (timestamp, Go version, OS/arch)
 
-This enables automated service discovery while maintaining security through basic authentication.
+This enables automated service discovery while maintaining security through basic authentication and provides version tracking for deployment verification.
 
 ## Development
 
@@ -75,13 +84,30 @@ go test -v ./...
 
 ### Local Build
 ```bash
-go build
+# Build with version information
+go build -ldflags "-X go.lumeweb.com/akash-metrics-exporter/pkg/build.Version=dev \
+                  -X go.lumeweb.com/akash-metrics-exporter/pkg/build.GitCommit=$(git rev-parse HEAD) \
+                  -X go.lumeweb.com/akash-metrics-exporter/pkg/build.BuildTime=$(date -u '+%Y-%m-%d_%H:%M:%S')" \
+         ./cmd/metrics-exporter
 ```
 
 ### Docker Build
 ```bash
 docker build -t akash-metrics-exporter .
 ```
+
+### Version Information
+The exporter includes built-in version tracking that is set at build time:
+- Version number (from git tag or manual setting)
+- Git commit hash
+- Build timestamp
+- Go version
+- OS/Architecture
+
+This information is:
+- Included in etcd registration
+- Available in metrics labels
+- Used for deployment verification
 
 ## Service Registration
 

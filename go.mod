@@ -6,7 +6,7 @@ require (
 	github.com/containerd/cgroups/v3 v3.0.5
 	github.com/prometheus/client_golang v1.20.5
 	github.com/stretchr/testify v1.10.0
-	go.lumeweb.com/etcd-registry v0.0.0-20241227133249-320d7597e317
+	go.lumeweb.com/etcd-registry v0.0.0-20241228121109-64bfc134d6d1
 )
 
 require (
@@ -32,6 +32,7 @@ require (
 	go.etcd.io/etcd/client/pkg/v3 v3.5.17 // indirect
 	go.etcd.io/etcd/client/v3 v3.5.17 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
+	go.uber.org/mock v0.5.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
 	golang.org/x/exp v0.0.0-20241108190413-2d47ceb2692f // indirect
