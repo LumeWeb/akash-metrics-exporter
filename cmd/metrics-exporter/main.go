@@ -331,107 +331,159 @@ func (a *App) setupHTTP(metricsPassword string) error {
 }
 
 func (a *App) shutdown() {
-	logger.Log.Info("Starting graceful shutdown")
+    logger.Log.Info("Starting graceful shutdown")
 
-	// Cancel context to stop registration
-	a.cancel()
+    // Cancel context to stop registration
+    if a.cancel != nil {
+        a.cancel()
+    }
 
-	// Create shutdown context
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer shutdownCancel()
+    // Create shutdown context
+    shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+    defer shutdownCancel()
 
-	// Shutdown HTTP server
-	if a.httpServer != nil {
-		if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
-			logger.Log.Errorf("HTTP server shutdown error: %v", err)
-		}
-	}
+    // Shutdown HTTP server
+    if a.httpServer != nil {
+        if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
+            logger.Log.Errorf("HTTP server shutdown error: %v", err)
+        }
+    }
 
-	// Close etcd registry
-	if a.registry != nil {
-		if err := a.registry.Close(); err != nil {
-			logger.Log.Errorf("Error closing etcd registry: %v", err)
-		}
-	}
+    // Close etcd registry
+    if a.registry != nil {
+        if err := a.registry.Close(); err != nil {
+            logger.Log.Errorf("Error closing etcd registry: %v", err)
+        }
+    }
 
-	// Wait for all goroutines
-	a.wg.Wait()
-	logger.Log.Info("Shutdown complete")
+    // Wait for all goroutines with timeout
+    done := make(chan struct{})
+    go func() {
+        a.wg.Wait()
+        close(done)
+    }()
+
+    select {
+    case <-done:
+        logger.Log.Info("All goroutines completed")
+    case <-shutdownCtx.Done():
+        logger.Log.Warn("Shutdown timed out waiting for goroutines")
+    }
+
+    logger.Log.Info("Shutdown complete")
 }
 
 func main() {
-	app := NewApp()
+    maxStartupRetries := 5
+    startupBackoff := time.Second * 5
+    var lastErr error
 
-	// Setup signal handling
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+    for attempt := 1; attempt <= maxStartupRetries; attempt++ {
+        if err := runApp(); err != nil {
+            lastErr = err
+            logger.Log.Errorf("Startup attempt %d/%d failed: %v", 
+                attempt, maxStartupRetries, err)
+            
+            if attempt < maxStartupRetries {
+                logger.Log.Infof("Waiting %v before retry...", startupBackoff)
+                time.Sleep(startupBackoff)
+                // Exponential backoff
+                startupBackoff *= 2
+                continue
+            }
+            logger.Log.Fatalf("Failed to start after %d attempts. Last error: %v",
+                maxStartupRetries, lastErr)
+        }
+        // If we get here, startup was successful
+        return
+    }
+}
 
-	// Validate required env vars
-	metricsPassword := os.Getenv("METRICS_PASSWORD")
-	if metricsPassword == "" {
-		logger.Log.Fatal("METRICS_PASSWORD environment variable must be set")
-	}
+func runApp() error {
+    app := NewApp()
+    
+    // Setup signal handling
+    signals := make(chan os.Signal, 1)
+    signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 
-	// Setup etcd if enabled
-	if err := app.setupEtcd(); err != nil {
-		logger.Log.Fatal(err)
-	}
+    // Defer cleanup in case of error
+    defer func() {
+        signal.Stop(signals)
+        app.shutdown()
+    }()
 
-	// Configure Prometheus metrics
-	systemMetrics := metrics.NewSystemMetrics()
-	prometheus.MustRegister(systemMetrics)
+    // Validate required env vars
+    metricsPassword := os.Getenv("METRICS_PASSWORD")
+    if metricsPassword == "" {
+        return fmt.Errorf("METRICS_PASSWORD environment variable must be set")
+    }
 
-	// Start HTTP server
-	if err := app.setupHTTP(metricsPassword); err != nil {
-		logger.Log.Fatal(err)
-	}
+    // Setup etcd if enabled
+    if err := app.setupEtcd(); err != nil {
+        if app.registry != nil {
+            if closeErr := app.registry.Close(); closeErr != nil {
+                logger.Log.Errorf("Failed to close registry after setup error: %v", closeErr)
+            }
+            app.registry = nil
+        }
+        return fmt.Errorf("etcd setup failed: %w", err)
+    }
 
-	// Start registration if etcd is enabled
-	if app.registry != nil {
-		serviceName := os.Getenv("METRICS_SERVICE_NAME")
-		if serviceName == "" {
-			logger.Log.Fatal("METRICS_SERVICE_NAME environment variable must be set")
-		}
+    // Configure Prometheus metrics
+    systemMetrics := metrics.NewSystemMetrics()
+    prometheus.MustRegister(systemMetrics)
 
-		metricsPort := os.Getenv("METRICS_PORT")
-		if metricsPort == "" {
-			metricsPort = strconv.Itoa(defaultPort)
-		}
+    // Start HTTP server
+    if err := app.setupHTTP(metricsPassword); err != nil {
+        return fmt.Errorf("HTTP server setup failed: %w", err)
+    }
 
-		// Handle Akash port mapping
-		registrationPort := metricsPort
-		akashPortVar := fmt.Sprintf("AKASH_EXTERNAL_PORT_%s", metricsPort)
-		if akashPort := os.Getenv(akashPortVar); akashPort != "" {
-			logger.Log.Infof("Found Akash external port mapping: %s - will use for etcd registration", akashPort)
-			registrationPort = akashPort
-		}
+    // Start registration if etcd is enabled
+    if app.registry != nil {
+        serviceName := os.Getenv("METRICS_SERVICE_NAME")
+        if serviceName == "" {
+            return fmt.Errorf("METRICS_SERVICE_NAME environment variable must be set")
+        }
 
-		akashIngressHost := os.Getenv("AKASH_INGRESS_HOST")
-		address := fmt.Sprintf("http://%s:%s/metrics", akashIngressHost, registrationPort)
+        metricsPort := os.Getenv("METRICS_PORT")
+        if metricsPort == "" {
+            metricsPort = strconv.Itoa(defaultPort)
+        }
 
-		node := types.Node{
-			ID:           getSelfNodeName(akashIngressHost),
-			ExporterType: "node_exporter",
-			Port:         mustParseInt(registrationPort),
-			MetricsPath:  "/metrics",
-			Labels: map[string]string{
-				"password": metricsPassword,
-				"address":  address,
-				"version": build.Version,
-				"git_commit": build.GitCommit,
-			},
-			Status: StatusStarting,
-			LastSeen: time.Now(),
-		}
+        // Handle Akash port mapping
+        registrationPort := metricsPort
+        akashPortVar := fmt.Sprintf("AKASH_EXTERNAL_PORT_%s", metricsPort)
+        if akashPort := os.Getenv(akashPortVar); akashPort != "" {
+            logger.Log.Infof("Found Akash external port mapping: %s - will use for etcd registration", akashPort)
+            registrationPort = akashPort
+        }
 
-		if err := app.startRegistration(serviceName, node); err != nil {
-			logger.Log.Fatal(err)
-		}
-	}
+        akashIngressHost := os.Getenv("AKASH_INGRESS_HOST")
+        address := fmt.Sprintf("http://%s:%s/metrics", akashIngressHost, registrationPort)
 
-	// Wait for shutdown signal
-	<-signals
-	app.shutdown()
+        node := types.Node{
+            ID:           getSelfNodeName(akashIngressHost),
+            ExporterType: "node_exporter",
+            Port:         mustParseInt(registrationPort),
+            MetricsPath:  "/metrics",
+            Labels: map[string]string{
+                "password":    metricsPassword,
+                "address":     address,
+                "version":     build.Version,
+                "git_commit":  build.GitCommit,
+            },
+            Status:    StatusStarting,
+            LastSeen:  time.Now(),
+        }
+
+        if err := app.startRegistration(serviceName, node); err != nil {
+            return fmt.Errorf("registration failed: %w", err)
+        }
+    }
+
+    // Wait for shutdown signal
+    <-signals
+    return nil
 }
 
 func basicAuthMiddleware(password string, next http.Handler) http.Handler {
