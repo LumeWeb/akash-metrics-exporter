@@ -370,6 +370,11 @@ func (a *App) startRegistration(serviceName string, node types.Node) error {
 		return fmt.Errorf("failed to setup etcd group: %w", err)
 	}
 
+	// Perform initial registration
+	if err := a.registerNode(a.ctx, node); err != nil {
+		return fmt.Errorf("initial registration failed: %w", err)
+	}
+
 	// Start health check which handles registration
 	a.startHealthCheck()
 
