@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/cenkalti/backoff/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.lumeweb.com/akash-metrics-exporter/pkg/build"
+	"go.lumeweb.com/akash-metrics-exporter/pkg/logger"
 	"go.lumeweb.com/akash-metrics-exporter/pkg/metrics"
+	"go.lumeweb.com/akash-metrics-exporter/pkg/util"
 	etcdregistry "go.lumeweb.com/etcd-registry"
 	"go.lumeweb.com/etcd-registry/types"
-	"go.lumeweb.com/akash-metrics-exporter/pkg/logger"
-	"go.lumeweb.com/akash-metrics-exporter/pkg/build"
+	"golang.org/x/time/rate"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,10 +26,10 @@ import (
 )
 
 const (
-	defaultPort        = 8080
-	defaultEtcdTimeout = 30 * time.Second
-	registrationTTL    = 30 * time.Second
-	shutdownTimeout    = 10 * time.Second
+	defaultPort         = 8080
+	defaultEtcdTimeout  = 30 * time.Second
+	registrationTTL     = 30 * time.Second
+	shutdownTimeout     = 10 * time.Second
 	healthCheckInterval = registrationTTL / 2
 
 	// Metric names
@@ -34,10 +38,10 @@ const (
 	metricLastRegistration   = "node_last_registration_timestamp"
 
 	// Node status constants
-	StatusStarting  = "starting"
-	StatusHealthy   = "healthy"
-	StatusDegraded  = "degraded"
-	StatusShutdown  = "shutdown"
+	StatusStarting = "starting"
+	StatusHealthy  = "healthy"
+	StatusDegraded = "degraded"
+	StatusShutdown = "shutdown"
 )
 
 type App struct {
@@ -52,18 +56,22 @@ type App struct {
 	regErrChan  <-chan error
 
 	// Metrics
-	regStatus      prometheus.Gauge
-	regErrors      prometheus.Counter
-	lastRegTime    prometheus.Gauge
+	regStatus   prometheus.Gauge
+	regErrors   prometheus.Counter
+	lastRegTime prometheus.Gauge
+
+	// Rate limiting
+	etcdLimiter *rate.Limiter
 }
 
 func NewApp() *App {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	app := &App{
-		ctx:    ctx,
-		cancel: cancel,
-		
+		ctx:         ctx,
+		cancel:      cancel,
+		etcdLimiter: rate.NewLimiter(rate.Every(time.Second), 10), // 10 ops/second max
+
 		// Initialize metrics
 		regStatus: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: metricRegistrationStatus,
@@ -94,20 +102,32 @@ func (a *App) setupEtcd() error {
 		return nil
 	}
 
-	var err error
-	a.registry, err = etcdregistry.NewEtcdRegistry(
-		strings.Split(etcdEndpoints, ","),
-		os.Getenv("ETCD_PREFIX"),
-		os.Getenv("ETCD_USERNAME"),
-		os.Getenv("ETCD_PASSWORD"),
-		defaultEtcdTimeout,
-		3, // maxRetries for connection attempts
+	success, err := util.RetryOperation(
+		func() (bool, error) {
+			var err error
+			a.registry, err = etcdregistry.NewEtcdRegistry(
+				strings.Split(etcdEndpoints, ","),
+				os.Getenv("ETCD_PREFIX"),
+				os.Getenv("ETCD_USERNAME"),
+				os.Getenv("ETCD_PASSWORD"),
+				defaultEtcdTimeout,
+				3,
+			)
+			if err != nil {
+				return false, fmt.Errorf("failed to create etcd registry: %w", err)
+			}
+			return true, nil
+		},
+		util.ConnectionRetry,
+		uint(3),
 	)
 	if err != nil {
-		return fmt.Errorf("failed to create etcd registry: %w", err)
+		return err
 	}
-
-	return nil
+	if !success {
+		return fmt.Errorf("failed to create etcd registry after retries")
+	}
+	return err
 }
 
 func (a *App) validateNodeInfo(node types.Node) error {
@@ -115,7 +135,7 @@ func (a *App) validateNodeInfo(node types.Node) error {
 		return fmt.Errorf("node ID is required")
 	}
 	if node.ExporterType == "" {
-		return fmt.Errorf("exporter type is required") 
+		return fmt.Errorf("exporter type is required")
 	}
 	if node.Port <= 0 {
 		return fmt.Errorf("port must be > 0")
@@ -123,7 +143,7 @@ func (a *App) validateNodeInfo(node types.Node) error {
 	if node.MetricsPath == "" {
 		return fmt.Errorf("metrics path is required")
 	}
-	
+
 	return nil
 }
 
@@ -150,26 +170,68 @@ func (a *App) updateNodeStatus(status string) error {
 	if !a.validateStatus(status) {
 		return fmt.Errorf("invalid status: %s", status)
 	}
-	
-	a.currentNode.Status = status
-	a.currentNode.LastSeen = time.Now()
 
-	// Update metrics based on status
-	if status == StatusHealthy {
-		a.regStatus.Set(1)
-		a.lastRegTime.Set(float64(time.Now().Unix()))
-	} else if status == StatusDegraded || status == StatusShutdown {
-		a.regStatus.Set(0)
-	}
-	
-	done, errChan, err := a.group.RegisterNode(a.ctx, a.currentNode, registrationTTL)
-	if err != nil {
-		return fmt.Errorf("failed to update node status: %w", err)
-	}
-	
-	a.regDone = done
-	a.regErrChan = errChan
-	return nil
+	_, err := util.RetryOperation(
+		func() (bool, error) {
+			if err := a.etcdLimiter.Wait(a.ctx); err != nil {
+				return false, fmt.Errorf("rate limit exceeded: %w", err)
+			}
+
+			a.currentNode.Status = status
+			a.currentNode.LastSeen = time.Now()
+
+			// Update metrics based on status
+			if status == StatusHealthy {
+				a.regStatus.Set(1)
+				a.lastRegTime.Set(float64(time.Now().Unix()))
+			} else if status == StatusDegraded || status == StatusShutdown {
+				a.regStatus.Set(0)
+			}
+
+			done, errChan, err := a.group.RegisterNode(a.ctx, a.currentNode, registrationTTL)
+			if err != nil {
+				return false, fmt.Errorf("failed to update node status: %w", err)
+			}
+
+			a.regDone = done
+			a.regErrChan = errChan
+			return true, nil
+		},
+		util.StatusRetry,
+		uint(3),
+	)
+	return err
+}
+
+func (a *App) registerNode(ctx context.Context, node types.Node) error {
+	_, err := util.RetryOperation(
+		func() (bool, error) {
+			if err := a.validateNodeInfo(node); err != nil {
+				return false, backoff.Permanent(fmt.Errorf("invalid node info: %w", err))
+			}
+
+			if err := a.etcdLimiter.Wait(ctx); err != nil {
+				return false, err
+			}
+
+			done, errChan, err := a.group.RegisterNode(ctx, node, registrationTTL)
+			if err != nil {
+				return false, err
+			}
+
+			select {
+			case <-done:
+				return true, nil
+			case err := <-errChan:
+				return false, err
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
+		},
+		util.RegistrationRetry,
+		uint(3),
+	)
+	return err
 }
 
 func (a *App) startHealthCheck() {
@@ -178,15 +240,18 @@ func (a *App) startHealthCheck() {
 		defer a.wg.Done()
 		ticker := time.NewTicker(healthCheckInterval)
 		defer ticker.Stop()
-		
+
 		for {
 			select {
 			case <-ticker.C:
-				if err := a.updateNodeStatus(StatusHealthy); err != nil {
+				if err := a.registerNode(a.ctx, a.currentNode); err != nil {
 					logger.Log.Errorf("Health check failed: %v", err)
+					a.regStatus.Set(0)
+				} else {
+					a.regStatus.Set(1)
+					a.lastRegTime.Set(float64(time.Now().Unix()))
 				}
 			case <-a.ctx.Done():
-				_ = a.updateNodeStatus(StatusShutdown)
 				return
 			}
 		}
@@ -195,108 +260,88 @@ func (a *App) startHealthCheck() {
 
 func (a *App) handleRegistrationFailure() error {
 	logger.Log.Warn("Attempting registration recovery")
-	
-	if err := a.setupEtcdGroup(a.currentNode.Labels["service"]); err != nil {
-		a.regErrors.Inc()
-		return fmt.Errorf("recovery failed - group setup: %w", err)
-	}
-	
-	a.currentNode.Status = StatusDegraded
-	done, errChan, err := a.group.RegisterNode(a.ctx, a.currentNode, registrationTTL)
-	if err != nil {
-		return fmt.Errorf("recovery failed - registration: %w", err)
-	}
-	
-	a.regDone = done
-	a.regErrChan = errChan
-	return nil
-}
 
-func (a *App) monitorRegistration() {
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		defer logger.Log.Info("Registration monitor stopped")
-
-		retryCount := 0
-		maxRetries := 3
-
-		for {
-			select {
-			case <-a.regDone:
-				logger.Log.Info("Registration successful")
-				retryCount = 0
-				
-			case err, ok := <-a.regErrChan:
-				if !ok {
-					return
-				}
-				if err != nil {
-					retryCount++
-					a.regErrors.Inc()
-					logger.Log.Errorf("Registration error (attempt %d/%d): %v", 
-						retryCount, maxRetries, err)
-					
-					if retryCount >= maxRetries {
-						if err := a.handleRegistrationFailure(); err != nil {
-							logger.Log.Errorf("Recovery failed: %v", err)
-							return
-						}
-						retryCount = 0
-					}
-				}
-				
-			case <-a.ctx.Done():
-				return
-			}
+	operation := func() error {
+		// Rate limit etcd operations
+		if err := a.etcdLimiter.Wait(a.ctx); err != nil {
+			return fmt.Errorf("rate limit exceeded: %w", err)
 		}
-	}()
+
+		if err := a.setupEtcdGroup(a.currentNode.Labels["service"]); err != nil {
+			a.regErrors.Inc()
+			return fmt.Errorf("group setup failed: %w", err)
+		}
+
+		a.currentNode.Status = StatusDegraded
+		done, errChan, err := a.group.RegisterNode(a.ctx, a.currentNode, registrationTTL)
+		if err != nil {
+			return fmt.Errorf("registration failed: %w", err)
+		}
+
+		a.regDone = done
+		a.regErrChan = errChan
+		return nil
+	}
+
+	_, err := util.RetryOperation(
+		func() (bool, error) {
+			if err := operation(); err != nil {
+				return false, err
+			}
+			return true, nil
+		},
+		util.RegistrationRetry,
+		3,
+	)
+	return err
 }
 
 func (a *App) setupEtcdGroup(serviceName string) error {
-	group, err := a.registry.CreateOrJoinServiceGroup(a.ctx, serviceName)
-	if err != nil {
-		return fmt.Errorf("failed to create/join service group: %w", err)
-	}
+	_, err := util.RetryOperation(
+		func() (bool, error) {
+			if err := a.etcdLimiter.Wait(a.ctx); err != nil {
+				return false, fmt.Errorf("rate limit exceeded: %w", err)
+			}
 
-	spec := types.ServiceGroupSpec{
-		CommonLabels: map[string]string{
-			"exporter_type": "node_exporter",
-			"service":       serviceName,
-			"os":           runtime.GOOS,
-			"arch":         runtime.GOARCH,
+			group, err := a.registry.CreateOrJoinServiceGroup(a.ctx, serviceName)
+			if err != nil {
+				return false, fmt.Errorf("failed to create/join service group: %w", err)
+			}
+
+			spec := types.ServiceGroupSpec{
+				CommonLabels: map[string]string{
+					"exporter_type": "node_exporter",
+					"service":       serviceName,
+					"os":            runtime.GOOS,
+					"arch":          runtime.GOARCH,
+				},
+			}
+
+			if err := a.etcdLimiter.Wait(a.ctx); err != nil {
+				return false, fmt.Errorf("rate limit exceeded: %w", err)
+			}
+
+			if err := group.Configure(spec); err != nil {
+				return false, fmt.Errorf("failed to configure service group: %w", err)
+			}
+
+			a.group = group
+			return true, nil
 		},
-	}
-
-	if err := group.Configure(spec); err != nil {
-		return fmt.Errorf("failed to configure service group: %w", err)
-	}
-
-	a.group = group
-	return nil
+		util.GroupRetry,
+		uint(3),
+	)
+	return err
 }
 
 func (a *App) startRegistration(serviceName string, node types.Node) error {
-	if err := a.validateNodeInfo(node); err != nil {
-		return fmt.Errorf("invalid node info: %w", err)
-	}
-
 	a.currentNode = node
 
 	if err := a.setupEtcdGroup(serviceName); err != nil {
 		return fmt.Errorf("failed to setup etcd group: %w", err)
 	}
 
-	done, errChan, err := a.group.RegisterNode(a.ctx, node, registrationTTL)
-	if err != nil {
-		return fmt.Errorf("failed to start registration: %w", err)
-	}
-
-	a.regDone = done
-	a.regErrChan = errChan
-
-	// Start monitoring and health checks
-	a.monitorRegistration()
+	// Start health check which handles registration
 	a.startHealthCheck()
 
 	return nil
@@ -322,7 +367,7 @@ func (a *App) setupHTTP(metricsPassword string) error {
 	go func() {
 		defer a.wg.Done()
 		logger.Log.Infof("Starting server on port %s", metricsPort)
-		if err := a.httpServer.ListenAndServe(); err != http.ErrServerClosed {
+		if err := a.httpServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			logger.Log.Errorf("HTTP server error: %v", err)
 		}
 	}()
@@ -331,159 +376,139 @@ func (a *App) setupHTTP(metricsPassword string) error {
 }
 
 func (a *App) shutdown() {
-    logger.Log.Info("Starting graceful shutdown")
+	logger.Log.Info("Starting graceful shutdown")
 
-    // Cancel context to stop registration
-    if a.cancel != nil {
-        a.cancel()
-    }
+	// Cancel context to stop registration
+	if a.cancel != nil {
+		a.cancel()
+	}
 
-    // Create shutdown context
-    shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
-    defer shutdownCancel()
+	// Create shutdown context
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
 
-    // Shutdown HTTP server
-    if a.httpServer != nil {
-        if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
-            logger.Log.Errorf("HTTP server shutdown error: %v", err)
-        }
-    }
+	// Shutdown HTTP server
+	if a.httpServer != nil {
+		if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
+			logger.Log.Errorf("HTTP server shutdown error: %v", err)
+		}
+	}
 
-    // Close etcd registry
-    if a.registry != nil {
-        if err := a.registry.Close(); err != nil {
-            logger.Log.Errorf("Error closing etcd registry: %v", err)
-        }
-    }
+	// Close etcd registry
+	if a.registry != nil {
+		if err := a.registry.Close(); err != nil {
+			logger.Log.Errorf("Error closing etcd registry: %v", err)
+		}
+	}
 
-    // Wait for all goroutines with timeout
-    done := make(chan struct{})
-    go func() {
-        a.wg.Wait()
-        close(done)
-    }()
+	// Wait for all goroutines with timeout
+	done := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
 
-    select {
-    case <-done:
-        logger.Log.Info("All goroutines completed")
-    case <-shutdownCtx.Done():
-        logger.Log.Warn("Shutdown timed out waiting for goroutines")
-    }
+	select {
+	case <-done:
+		logger.Log.Info("All goroutines completed")
+	case <-shutdownCtx.Done():
+		logger.Log.Warn("Shutdown timed out waiting for goroutines")
+	}
 
-    logger.Log.Info("Shutdown complete")
+	logger.Log.Info("Shutdown complete")
 }
 
 func main() {
-    maxStartupRetries := 5
-    startupBackoff := time.Second * 5
-    var lastErr error
-
-    for attempt := 1; attempt <= maxStartupRetries; attempt++ {
-        if err := runApp(); err != nil {
-            lastErr = err
-            logger.Log.Errorf("Startup attempt %d/%d failed: %v", 
-                attempt, maxStartupRetries, err)
-            
-            if attempt < maxStartupRetries {
-                logger.Log.Infof("Waiting %v before retry...", startupBackoff)
-                time.Sleep(startupBackoff)
-                // Exponential backoff
-                startupBackoff *= 2
-                continue
-            }
-            logger.Log.Fatalf("Failed to start after %d attempts. Last error: %v",
-                maxStartupRetries, lastErr)
-        }
-        // If we get here, startup was successful
-        return
-    }
+	if err := runApp(); err != nil {
+		logger.Log.Fatalf("Failed to start application: %v", err)
+	}
 }
 
 func runApp() error {
-    app := NewApp()
-    
-    // Setup signal handling
-    signals := make(chan os.Signal, 1)
-    signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	app := NewApp()
 
-    // Defer cleanup in case of error
-    defer func() {
-        signal.Stop(signals)
-        app.shutdown()
-    }()
+	// Setup signal handling
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 
-    // Validate required env vars
-    metricsPassword := os.Getenv("METRICS_PASSWORD")
-    if metricsPassword == "" {
-        return fmt.Errorf("METRICS_PASSWORD environment variable must be set")
-    }
+	// Defer cleanup in case of error
+	defer func() {
+		signal.Stop(signals)
+		app.shutdown()
+	}()
 
-    // Setup etcd if enabled
-    if err := app.setupEtcd(); err != nil {
-        if app.registry != nil {
-            if closeErr := app.registry.Close(); closeErr != nil {
-                logger.Log.Errorf("Failed to close registry after setup error: %v", closeErr)
-            }
-            app.registry = nil
-        }
-        return fmt.Errorf("etcd setup failed: %w", err)
-    }
+	// Validate required env vars
+	metricsPassword := os.Getenv("METRICS_PASSWORD")
+	if metricsPassword == "" {
+		return fmt.Errorf("METRICS_PASSWORD environment variable must be set")
+	}
 
-    // Configure Prometheus metrics
-    systemMetrics := metrics.NewSystemMetrics()
-    prometheus.MustRegister(systemMetrics)
+	// Setup etcd if enabled
+	if err := app.setupEtcd(); err != nil {
+		if app.registry != nil {
+			if closeErr := app.registry.Close(); closeErr != nil {
+				logger.Log.Errorf("Failed to close registry after setup error: %v", closeErr)
+			}
+			app.registry = nil
+		}
+		return fmt.Errorf("etcd setup failed: %w", err)
+	}
 
-    // Start HTTP server
-    if err := app.setupHTTP(metricsPassword); err != nil {
-        return fmt.Errorf("HTTP server setup failed: %w", err)
-    }
+	// Configure Prometheus metrics
+	systemMetrics := metrics.NewSystemMetrics()
+	prometheus.MustRegister(systemMetrics)
 
-    // Start registration if etcd is enabled
-    if app.registry != nil {
-        serviceName := os.Getenv("METRICS_SERVICE_NAME")
-        if serviceName == "" {
-            return fmt.Errorf("METRICS_SERVICE_NAME environment variable must be set")
-        }
+	// Start HTTP server
+	if err := app.setupHTTP(metricsPassword); err != nil {
+		return fmt.Errorf("HTTP server setup failed: %w", err)
+	}
 
-        metricsPort := os.Getenv("METRICS_PORT")
-        if metricsPort == "" {
-            metricsPort = strconv.Itoa(defaultPort)
-        }
+	// Start registration if etcd is enabled
+	if app.registry != nil {
+		serviceName := os.Getenv("METRICS_SERVICE_NAME")
+		if serviceName == "" {
+			return fmt.Errorf("METRICS_SERVICE_NAME environment variable must be set")
+		}
 
-        // Handle Akash port mapping
-        registrationPort := metricsPort
-        akashPortVar := fmt.Sprintf("AKASH_EXTERNAL_PORT_%s", metricsPort)
-        if akashPort := os.Getenv(akashPortVar); akashPort != "" {
-            logger.Log.Infof("Found Akash external port mapping: %s - will use for etcd registration", akashPort)
-            registrationPort = akashPort
-        }
+		metricsPort := os.Getenv("METRICS_PORT")
+		if metricsPort == "" {
+			metricsPort = strconv.Itoa(defaultPort)
+		}
 
-        akashIngressHost := os.Getenv("AKASH_INGRESS_HOST")
-        address := fmt.Sprintf("http://%s:%s/metrics", akashIngressHost, registrationPort)
+		// Handle Akash port mapping
+		registrationPort := metricsPort
+		akashPortVar := fmt.Sprintf("AKASH_EXTERNAL_PORT_%s", metricsPort)
+		if akashPort := os.Getenv(akashPortVar); akashPort != "" {
+			logger.Log.Infof("Found Akash external port mapping: %s - will use for etcd registration", akashPort)
+			registrationPort = akashPort
+		}
 
-        node := types.Node{
-            ID:           getSelfNodeName(akashIngressHost),
-            ExporterType: "node_exporter",
-            Port:         mustParseInt(registrationPort),
-            MetricsPath:  "/metrics",
-            Labels: map[string]string{
-                "password":    metricsPassword,
-                "address":     address,
-                "version":     build.Version,
-                "git_commit":  build.GitCommit,
-            },
-            Status:    StatusStarting,
-            LastSeen:  time.Now(),
-        }
+		akashIngressHost := os.Getenv("AKASH_INGRESS_HOST")
+		address := fmt.Sprintf("http://%s:%s/metrics", akashIngressHost, registrationPort)
 
-        if err := app.startRegistration(serviceName, node); err != nil {
-            return fmt.Errorf("registration failed: %w", err)
-        }
-    }
+		node := types.Node{
+			ID:           getSelfNodeName(akashIngressHost),
+			ExporterType: "node_exporter",
+			Port:         mustParseInt(registrationPort),
+			MetricsPath:  "/metrics",
+			Labels: map[string]string{
+				"password":   metricsPassword,
+				"address":    address,
+				"version":    build.Version,
+				"git_commit": build.GitCommit,
+			},
+			Status:   StatusStarting,
+			LastSeen: time.Now(),
+		}
 
-    // Wait for shutdown signal
-    <-signals
-    return nil
+		if err := app.startRegistration(serviceName, node); err != nil {
+			return fmt.Errorf("registration failed: %w", err)
+		}
+	}
+
+	// Wait for shutdown signal
+	<-signals
+	return nil
 }
 
 func basicAuthMiddleware(password string, next http.Handler) http.Handler {
