@@ -27,8 +27,8 @@ import (
 
 const (
 	defaultPort         = 8080
-	defaultEtcdTimeout  = 30 * time.Second
-	registrationTTL     = 30 * time.Second
+	defaultEtcdTimeout  = 60 * time.Second
+	registrationTTL     = 60 * time.Second
 	shutdownTimeout     = 10 * time.Second
 	healthCheckInterval = registrationTTL / 2
 
@@ -72,7 +72,7 @@ func NewApp() *App {
 	app := &App{
 		ctx:         ctx,
 		cancel:      cancel,
-		etcdLimiter: rate.NewLimiter(rate.Every(time.Second), 10), // 10 ops/second max
+		etcdLimiter: rate.NewLimiter(rate.Every(2*time.Second), 5), // 5 ops/2 seconds max
 
 		// Initialize metrics
 		regStatus: prometheus.NewGauge(prometheus.GaugeOpts{
