@@ -65,8 +65,31 @@ func (a *App) setupEtcd() error {
 	return nil
 }
 
+func (a *App) validateNodeInfo(node etcdregistry.Node) error {
+	if node.Name == "" {
+		return fmt.Errorf("node name is required")
+	}
+	
+	required := []string{"port", "address", "password"}
+	for _, field := range required {
+		if _, ok := node.Info[field]; !ok {
+			return fmt.Errorf("missing required node info field: %s", field)
+		}
+	}
+	
+	return nil
+}
+
 func (a *App) startRegistration(serviceName string, node etcdregistry.Node) error {
-	done, errChan, err := a.registry.RegisterNode(a.ctx, serviceName, node, registrationTTL)
+	if err := a.validateNodeInfo(node); err != nil {
+		return fmt.Errorf("invalid node info: %w", err)
+	}
+
+	// Create registration context with timeout
+	regCtx, regCancel := context.WithTimeout(a.ctx, defaultEtcdTimeout)
+	defer regCancel()
+
+	done, errChan, err := a.registry.RegisterNode(regCtx, serviceName, node, registrationTTL)
 	if err != nil {
 		return fmt.Errorf("failed to start registration: %w", err)
 	}
@@ -80,13 +103,15 @@ func (a *App) startRegistration(serviceName string, node etcdregistry.Node) erro
 		defer a.wg.Done()
 		defer logger.Log.Info("Registration goroutine stopped")
 
-		// Wait for initial registration
+		// Wait for initial registration with timeout
 		select {
 		case <-done:
 			logger.Log.Info("Initial registration complete")
 		case err := <-errChan:
 			logger.Log.Errorf("Initial registration error: %v", err)
-			// Don't return on initial error - continue monitoring
+		case <-regCtx.Done():
+			logger.Log.Error("Initial registration timed out")
+			return
 		case <-a.ctx.Done():
 			return
 		}
@@ -100,6 +125,9 @@ func (a *App) startRegistration(serviceName string, node etcdregistry.Node) erro
 					return
 				}
 				logger.Log.Errorf("Registration error: %v", err)
+			case <-done:
+				logger.Log.Info("Registration completed")
+				return
 			case <-a.ctx.Done():
 				return
 			}
@@ -154,16 +182,40 @@ func (a *App) shutdown() {
 		}
 	}
 
-	// Wait for registration to complete if in progress
-	if a.regDone != nil {
-		select {
-		case <-a.regDone:
-			logger.Log.Debug("Registration completed during shutdown")
-		case <-shutdownCtx.Done():
-			logger.Log.Warn("Timeout waiting for registration completion")
+	// Clean up registration
+	if a.regDone != nil || a.regErrChan != nil {
+		cleanupTimer := time.NewTimer(5 * time.Second)
+		defer cleanupTimer.Stop()
+
+		// Wait for registration to complete or timeout
+		if a.regDone != nil {
+			select {
+			case <-a.regDone:
+				logger.Log.Debug("Registration completed during shutdown")
+			case <-cleanupTimer.C:
+				logger.Log.Warn("Timeout waiting for registration completion")
+			}
+		}
+
+		// Drain error channel
+		if a.regErrChan != nil {
+			for {
+				select {
+				case err, ok := <-a.regErrChan:
+					if !ok {
+						logger.Log.Debug("Registration error channel closed")
+						goto cleanup
+					}
+					logger.Log.Debugf("Registration error during shutdown: %v", err)
+				case <-cleanupTimer.C:
+					logger.Log.Warn("Timeout draining registration error channel")
+					goto cleanup
+				}
+			}
 		}
 	}
 
+cleanup:
 	// Close etcd registry
 	if a.registry != nil {
 		if err := a.registry.Close(); err != nil {
