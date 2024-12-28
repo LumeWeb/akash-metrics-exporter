@@ -27,16 +27,16 @@ import (
 
 const (
 	defaultPort         = 8080
-	defaultEtcdTimeout  = 60 * time.Second
-	registrationTTL     = 60 * time.Second
+	defaultEtcdTimeout  = 120 * time.Second
+	registrationTTL     = 90 * time.Second
 	shutdownTimeout     = 10 * time.Second
-	healthCheckInterval = registrationTTL / 2
+	healthCheckInterval = 45 * time.Second
 
 	// Metric names
 	metricRegistrationStatus = "node_registration_status"
 	metricRegistrationErrors = "node_registration_errors_total"
 	metricLastRegistration   = "node_last_registration_timestamp"
-	metricDeploymentInfo    = "node_deployment_info"
+	metricDeploymentInfo     = "node_deployment_info"
 
 	// Node status constants
 	StatusStarting = "starting"
@@ -72,7 +72,7 @@ func NewApp() *App {
 	app := &App{
 		ctx:         ctx,
 		cancel:      cancel,
-		etcdLimiter: rate.NewLimiter(rate.Every(2*time.Second), 5), // 5 ops/2 seconds max
+		etcdLimiter: rate.NewLimiter(rate.Every(5*time.Second), 3), // Reduce rate further
 
 		// Initialize metrics
 		regStatus: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -502,10 +502,11 @@ func runApp() error {
 		}
 
 		akashIngressHost := os.Getenv("AKASH_INGRESS_HOST")
+		// Ensure we use the full ingress hostname for the metrics endpoint
 		address := fmt.Sprintf("http://%s:%s/metrics", akashIngressHost, registrationPort)
 
 		identifiers := getNodeIdentifiers(akashIngressHost)
-		
+
 		node := types.Node{
 			ID:           identifiers.HashID,
 			ExporterType: "node_exporter",
@@ -517,7 +518,8 @@ func runApp() error {
 				"version":       build.Version,
 				"git_commit":    build.GitCommit,
 				"deployment_id": identifiers.DeploymentID,
-				"hash_id":      identifiers.HashID,
+				"hash_id":       identifiers.HashID,
+				"ingress_host":  akashIngressHost,
 			},
 			Status:   StatusStarting,
 			LastSeen: time.Now(),
