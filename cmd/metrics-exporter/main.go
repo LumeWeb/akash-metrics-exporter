@@ -257,9 +257,19 @@ func (a *App) startHealthCheck() {
 	go func() {
 		defer a.wg.Done()
 
+		// Create ticker for LastSeen updates
+		updateTicker := time.NewTicker(1 * time.Minute)
+		defer updateTicker.Stop()
+
 		// Monitor the registration channels
 		for {
 			select {
+			case <-updateTicker.C:
+				// Update LastSeen timestamp periodically
+				if err := a.updateNodeStatus(a.currentNode.Status); err != nil {
+					logger.Log.Errorf("Failed to update LastSeen: %v", err)
+				}
+
 			case <-a.regDone:
 				// Registration expired/completed, need to re-register
 				if err := a.updateNodeStatus(StatusHealthy); err != nil {
