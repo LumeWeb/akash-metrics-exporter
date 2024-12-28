@@ -333,6 +333,7 @@ func (a *App) setupEtcdGroup(serviceName string) error {
 					"os":            runtime.GOOS,
 					"arch":          runtime.GOARCH,
 				},
+				Password: os.Getenv("METRICS_PASSWORD"),
 			}
 
 			if err := a.etcdLimiter.Wait(a.ctx); err != nil {
