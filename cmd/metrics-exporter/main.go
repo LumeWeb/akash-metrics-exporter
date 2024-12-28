@@ -26,11 +26,13 @@ const (
 )
 
 type App struct {
-	registry   *etcdregistry.EtcdRegistry
-	httpServer *http.Server
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	registry    *etcdregistry.EtcdRegistry
+	httpServer  *http.Server
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	regDone     <-chan struct{}
+	regErrChan  <-chan error
 }
 
 func NewApp() *App {
@@ -69,6 +71,10 @@ func (a *App) startRegistration(serviceName string, node etcdregistry.Node) erro
 		return fmt.Errorf("failed to start registration: %w", err)
 	}
 
+	// Store channels for cleanup
+	a.regDone = done
+	a.regErrChan = errChan
+
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
@@ -80,6 +86,7 @@ func (a *App) startRegistration(serviceName string, node etcdregistry.Node) erro
 			logger.Log.Info("Initial registration complete")
 		case err := <-errChan:
 			logger.Log.Errorf("Initial registration error: %v", err)
+			// Don't return on initial error - continue monitoring
 		case <-a.ctx.Done():
 			return
 		}
@@ -89,6 +96,7 @@ func (a *App) startRegistration(serviceName string, node etcdregistry.Node) erro
 			select {
 			case err, ok := <-errChan:
 				if !ok {
+					logger.Log.Info("Registration error channel closed")
 					return
 				}
 				logger.Log.Errorf("Registration error: %v", err)
@@ -143,6 +151,16 @@ func (a *App) shutdown() {
 	if a.httpServer != nil {
 		if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
 			logger.Log.Errorf("HTTP server shutdown error: %v", err)
+		}
+	}
+
+	// Wait for registration to complete if in progress
+	if a.regDone != nil {
+		select {
+		case <-a.regDone:
+			logger.Log.Debug("Registration completed during shutdown")
+		case <-shutdownCtx.Done():
+			logger.Log.Warn("Timeout waiting for registration completion")
 		}
 	}
 
