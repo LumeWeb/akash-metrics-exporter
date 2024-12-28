@@ -262,13 +262,13 @@ func (a *App) startHealthCheck() {
 			select {
 			case <-a.regDone:
 				// Registration expired/completed, need to re-register
-				if err := a.registerNode(a.ctx, a.currentNode); err != nil {
+				if err := a.updateNodeStatus(StatusHealthy); err != nil {
 					logger.Log.Errorf("Re-registration failed: %v", err)
-					a.regStatus.Set(0)
 					a.regErrors.Inc()
-				} else {
-					a.regStatus.Set(1)
-					a.lastRegTime.Set(float64(time.Now().Unix()))
+					// Try to mark as degraded
+					if err := a.updateNodeStatus(StatusDegraded); err != nil {
+						logger.Log.Errorf("Failed to update degraded status: %v", err)
+					}
 				}
 			case err := <-a.regErrChan:
 				logger.Log.Errorf("Registration error: %v", err)
@@ -300,14 +300,9 @@ func (a *App) handleRegistrationFailure() error {
 			return fmt.Errorf("group setup failed: %w", err)
 		}
 
-		a.currentNode.Status = StatusDegraded
-		done, errChan, err := a.group.RegisterNode(a.ctx, a.currentNode, registrationTTL)
-		if err != nil {
+		if err := a.updateNodeStatus(StatusDegraded); err != nil {
 			return fmt.Errorf("registration failed: %w", err)
 		}
-
-		a.regDone = done
-		a.regErrChan = errChan
 		return nil
 	}
 
@@ -411,6 +406,11 @@ func (a *App) setupHTTP(metricsPassword string) error {
 
 func (a *App) shutdown() {
 	logger.Log.Info("Starting graceful shutdown")
+
+	// Update status before shutdown
+	if err := a.updateNodeStatus(StatusShutdown); err != nil {
+		logger.Log.Errorf("Failed to update shutdown status: %v", err)
+	}
 
 	// Cancel context to stop registration and health checks
 	if a.cancel != nil {
