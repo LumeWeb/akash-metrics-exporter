@@ -415,21 +415,6 @@ func runApp() error {
 		return fmt.Errorf("METRICS_PASSWORD environment variable must be set")
 	}
 
-	// Start etcd setup in background
-	app.wg.Add(1)
-	go func() {
-		defer app.wg.Done()
-		if err := app.setupEtcd(); err != nil {
-			if app.registry != nil {
-				if closeErr := app.registry.Close(); closeErr != nil {
-					logger.Log.Errorf("Failed to close registry after setup error: %v", closeErr)
-				}
-				app.registry = nil
-			}
-			logger.Log.Fatalf("Etcd setup failed: %v", err)
-		}
-	}()
-
 	// Configure Prometheus metrics
 	systemMetrics := metrics.NewSystemMetrics()
 	prometheus.MustRegister(systemMetrics)
@@ -439,63 +424,82 @@ func runApp() error {
 		return fmt.Errorf("HTTP server setup failed: %w", err)
 	}
 
-	// Start registration if etcd is enabled
-	if app.registry != nil {
-		serviceName := os.Getenv("METRICS_SERVICE_NAME")
-		if serviceName == "" {
-			return fmt.Errorf("METRICS_SERVICE_NAME environment variable must be set")
-		}
-
-		metricsPort := os.Getenv("METRICS_PORT")
-		if metricsPort == "" {
-			metricsPort = strconv.Itoa(defaultPort)
-		}
-
-		// Handle Akash port mapping
-		registrationPort := metricsPort
-		akashPortVar := fmt.Sprintf("AKASH_EXTERNAL_PORT_%s", metricsPort)
-		if akashPort := os.Getenv(akashPortVar); akashPort != "" {
-			logger.Log.Infof("Found Akash external port mapping: %s - will use for etcd registration", akashPort)
-			registrationPort = akashPort
-		}
-
-		akashIngressHost := os.Getenv("AKASH_INGRESS_HOST")
-		// Ensure we use the full ingress hostname for the metrics endpoint
-		address := fmt.Sprintf("http://%s:%s/metrics", akashIngressHost, registrationPort)
-
-		identifiers := getNodeIdentifiers(akashIngressHost)
-
-		node := types.Node{
-			ID:           identifiers.HashID,
-			ExporterType: "node_exporter",
-			Port:         mustParseInt(registrationPort),
-			MetricsPath:  "/metrics",
-			Labels: map[string]string{
-				"address":       address,
-				"version":       build.Version,
-				"git_commit":    build.GitCommit,
-				"deployment_id": identifiers.DeploymentID,
-				"hash_id":       identifiers.HashID,
-				"ingress_host":  akashIngressHost,
-			},
-			Status:   StatusStarting,
-			LastSeen: time.Now(),
-		}
-
-		// Set deployment info metric
-		app.deploymentInfo.With(prometheus.Labels{
-			"hash_id":       identifiers.HashID,
-			"deployment_id": identifiers.DeploymentID,
-		}).Set(1)
-
-		if err := app.startRegistration(serviceName, node); err != nil {
-			return fmt.Errorf("registration failed: %w", err)
-		}
+	// Start async etcd setup and registration
+	if os.Getenv("ETCD_ENDPOINTS") != "" {
+		app.wg.Add(1)
+		go func() {
+			defer app.wg.Done()
+			if err := app.setupAndRegister(); err != nil {
+				logger.Log.Errorf("Etcd setup/registration failed: %v", err)
+			}
+		}()
 	}
 
 	// Wait for shutdown signal
 	<-signals
 	return nil
+}
+
+func (a *App) setupAndRegister() error {
+	// Setup etcd first
+	if err := a.setupEtcd(); err != nil {
+		if a.registry != nil {
+			if closeErr := a.registry.Close(); closeErr != nil {
+				logger.Log.Errorf("Failed to close registry after setup error: %v", closeErr)
+			}
+			a.registry = nil
+		}
+		return fmt.Errorf("etcd setup failed: %v", err)
+	}
+
+	// Proceed with registration
+	serviceName := os.Getenv("METRICS_SERVICE_NAME")
+	if serviceName == "" {
+		return fmt.Errorf("METRICS_SERVICE_NAME environment variable must be set")
+	}
+
+	metricsPort := os.Getenv("METRICS_PORT")
+	if metricsPort == "" {
+		metricsPort = strconv.Itoa(defaultPort)
+	}
+
+	// Handle Akash port mapping
+	registrationPort := metricsPort
+	akashPortVar := fmt.Sprintf("AKASH_EXTERNAL_PORT_%s", metricsPort)
+	if akashPort := os.Getenv(akashPortVar); akashPort != "" {
+		logger.Log.Infof("Found Akash external port mapping: %s - will use for etcd registration", akashPort)
+		registrationPort = akashPort
+	}
+
+	akashIngressHost := os.Getenv("AKASH_INGRESS_HOST")
+	address := fmt.Sprintf("http://%s:%s/metrics", akashIngressHost, registrationPort)
+
+	identifiers := getNodeIdentifiers(akashIngressHost)
+
+	node := types.Node{
+		ID:           identifiers.HashID,
+		ExporterType: "node_exporter",
+		Port:         mustParseInt(registrationPort),
+		MetricsPath:  "/metrics",
+		Labels: map[string]string{
+			"address":       address,
+			"version":       build.Version,
+			"git_commit":    build.GitCommit,
+			"deployment_id": identifiers.DeploymentID,
+			"hash_id":       identifiers.HashID,
+			"ingress_host":  akashIngressHost,
+		},
+		Status:   StatusStarting,
+		LastSeen: time.Now(),
+	}
+
+	// Set deployment info metric
+	a.deploymentInfo.With(prometheus.Labels{
+		"hash_id":       identifiers.HashID,
+		"deployment_id": identifiers.DeploymentID,
+	}).Set(1)
+
+	return a.startRegistration(serviceName, node)
 }
 
 func basicAuthMiddleware(password string, next http.Handler) http.Handler {
