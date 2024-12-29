@@ -500,16 +500,20 @@ func runApp() error {
 		return fmt.Errorf("METRICS_PASSWORD environment variable must be set")
 	}
 
-	// Setup etcd if enabled
-	if err := app.setupEtcd(); err != nil {
-		if app.registry != nil {
-			if closeErr := app.registry.Close(); closeErr != nil {
-				logger.Log.Errorf("Failed to close registry after setup error: %v", closeErr)
+	// Start etcd setup in background
+	app.wg.Add(1)
+	go func() {
+		defer app.wg.Done()
+		if err := app.setupEtcd(); err != nil {
+			if app.registry != nil {
+				if closeErr := app.registry.Close(); closeErr != nil {
+					logger.Log.Errorf("Failed to close registry after setup error: %v", closeErr)
+				}
+				app.registry = nil
 			}
-			app.registry = nil
+			logger.Log.Fatalf("Etcd setup failed: %v", err)
 		}
-		return fmt.Errorf("etcd setup failed: %w", err)
-	}
+	}()
 
 	// Configure Prometheus metrics
 	systemMetrics := metrics.NewSystemMetrics()
