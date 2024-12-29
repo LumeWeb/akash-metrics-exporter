@@ -27,9 +27,9 @@ import (
 const (
 	defaultPort         = 8080
 	defaultEtcdTimeout  = 10 * time.Minute // Increased timeout to reduce connection churn
-	registrationTTL     = 5 * time.Minute  // Increased TTL to reduce lease operations
+	registrationTTL     = 15 * time.Minute // Further increased TTL to reduce lease operations
 	shutdownTimeout     = 30 * time.Second
-	healthCheckInterval = 3 * time.Minute // Reduced health check frequency
+	healthCheckInterval = 3 * time.Minute  // Reduced health check frequency
 
 	// Metric names
 	metricRegistrationStatus = "node_registration_status"
@@ -308,15 +308,21 @@ func (a *App) setupEtcdGroup(serviceName string) error {
 }
 
 func (a *App) startRegistration(serviceName string, node types.Node) error {
+	// Rate limit registration attempts
+	if err := a.etcdLimiter.Wait(a.ctx); err != nil {
+		return fmt.Errorf("rate limit exceeded: %w", err)
+	}
+
 	a.currentNode = node
 
 	if err := a.setupEtcdGroup(serviceName); err != nil {
 		return fmt.Errorf("failed to setup etcd group: %w", err)
 	}
 
-	// Perform initial registration
+	// Single registration attempt without retries
 	if err := a.registerNode(a.ctx, node); err != nil {
-		return fmt.Errorf("initial registration failed: %w", err)
+		logger.Log.Warnf("Registration failed: %v", err)
+		return err
 	}
 
 	return nil
