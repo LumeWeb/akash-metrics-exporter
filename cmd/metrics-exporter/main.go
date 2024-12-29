@@ -7,6 +7,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.lumeweb.com/akash-metrics-exporter/pkg/build"
+	"go.lumeweb.com/akash-metrics-exporter/pkg/config"
 	"go.lumeweb.com/akash-metrics-exporter/pkg/logger"
 	"go.lumeweb.com/akash-metrics-exporter/pkg/metrics"
 	"go.lumeweb.com/akash-metrics-exporter/pkg/util"
@@ -29,7 +30,7 @@ const (
 	defaultEtcdTimeout  = 10 * time.Minute // Increased timeout for stability
 	registrationTTL     = 15 * time.Minute // Increased TTL to reduce lease operations
 	shutdownTimeout     = 30 * time.Second
-	healthCheckInterval = 3 * time.Minute  // Reduced frequency to minimize overhead
+	healthCheckInterval = 3 * time.Minute // Reduced frequency to minimize overhead
 
 	// Metric names
 	metricRegistrationStatus = "node_registration_status"
@@ -55,6 +56,9 @@ type App struct {
 	regDone     <-chan struct{}
 	regErrChan  <-chan error
 
+	// Configuration
+	config *config.Config
+
 	// Metrics
 	regStatus      prometheus.Gauge
 	regErrors      prometheus.Counter
@@ -65,12 +69,13 @@ type App struct {
 	etcdLimiter *rate.Limiter
 }
 
-func NewApp() *App {
+func NewApp(cfg *config.Config) *App {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	app := &App{
 		ctx:         ctx,
 		cancel:      cancel,
+		config:      cfg,
 		etcdLimiter: rate.NewLimiter(rate.Every(5*time.Second), 3), // More balanced rate limiting
 
 		// Initialize metrics
@@ -335,17 +340,14 @@ func (a *App) startRegistration(serviceName string, node types.Node) error {
 	return nil
 }
 
-func (a *App) setupHTTP(metricsPassword string) error {
-	metricsPort := os.Getenv("METRICS_PORT")
-	if metricsPort == "" {
-		metricsPort = strconv.Itoa(defaultPort)
-	}
+func (a *App) setupHTTP() error {
+	metricsPort := strconv.Itoa(a.config.MetricsPort)
 
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", basicAuthMiddleware(metricsPassword, promhttp.Handler()))
+	mux.Handle(a.config.TargetPath, a.basicAuthMiddleware(promhttp.Handler()))
 
 	a.httpServer = &http.Server{
-		Addr:         fmt.Sprintf(":%s", metricsPort),
+		Addr:         fmt.Sprintf(":%d", a.config.MetricsPort),
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
@@ -404,7 +406,16 @@ func main() {
 }
 
 func runApp() error {
-	app := NewApp()
+	cfg, err := config.NewConfig()
+	if err != nil {
+		return fmt.Errorf("failed to create config: %w", err)
+	}
+
+	if cfg.Password == "" {
+		return fmt.Errorf("METRICS_PASSWORD environment variable must be set")
+	}
+
+	app := NewApp(cfg)
 
 	// Setup signal handling
 	signals := make(chan os.Signal, 1)
@@ -427,7 +438,7 @@ func runApp() error {
 	prometheus.MustRegister(systemMetrics)
 
 	// Start HTTP server
-	if err := app.setupHTTP(metricsPassword); err != nil {
+	if err := app.setupHTTP(); err != nil {
 		return fmt.Errorf("HTTP server setup failed: %w", err)
 	}
 
@@ -465,36 +476,47 @@ func (a *App) setupAndRegister() error {
 		return fmt.Errorf("METRICS_SERVICE_NAME environment variable must be set")
 	}
 
-	metricsPort := os.Getenv("METRICS_PORT")
-	if metricsPort == "" {
-		metricsPort = strconv.Itoa(defaultPort)
+	cfg, err := config.NewConfig()
+	if err != nil {
+		return fmt.Errorf("failed to create cfg: %w", err)
+	}
+
+	// Load configuration from environment
+	if port := os.Getenv("METRICS_PORT"); port != "" {
+		cfg.MetricsPort = mustParseInt(port)
 	}
 
 	// Handle Akash port mapping
-	registrationPort := metricsPort
-	akashPortVar := fmt.Sprintf("AKASH_EXTERNAL_PORT_%s", metricsPort)
+	akashPortVar := fmt.Sprintf("AKASH_EXTERNAL_PORT_%d", cfg.MetricsPort)
 	if akashPort := os.Getenv(akashPortVar); akashPort != "" {
-		logger.Log.Infof("Found Akash external port mapping: %s - will use for etcd registration", akashPort)
-		registrationPort = akashPort
+		logger.Log.Infof("Found Akash external port mapping: %s", akashPort)
+		cfg.ExternalPort = mustParseInt(akashPort)
 	}
 
-	akashIngressHost := os.Getenv("AKASH_INGRESS_HOST")
-	address := fmt.Sprintf("http://%s:%s/metrics", akashIngressHost, registrationPort)
+	cfg.TargetHost = os.Getenv("AKASH_INGRESS_HOST")
+	cfg.Password = cfg.Password
+	cfg.ServiceName = serviceName
 
-	identifiers := getNodeIdentifiers(akashIngressHost)
+	address := fmt.Sprintf("http://%s:%d%s",
+		cfg.TargetHost,
+		cfg.GetEffectivePort(),
+		cfg.TargetPath)
+
+	identifiers := getNodeIdentifiers(cfg.TargetHost)
 
 	node := types.Node{
 		ID:           identifiers.HashID,
 		ExporterType: "node_exporter",
-		Port:         mustParseInt(registrationPort),
-		MetricsPath:  "/metrics",
+		Port:         cfg.GetEffectivePort(),
+		MetricsPath:  cfg.TargetPath,
 		Labels: map[string]string{
 			"address":       address,
 			"version":       build.Version,
 			"git_commit":    build.GitCommit,
 			"deployment_id": identifiers.DeploymentID,
 			"hash_id":       identifiers.HashID,
-			"ingress_host":  akashIngressHost,
+			"ingress_host":  cfg.TargetHost,
+			"target_port":   strconv.Itoa(cfg.TargetPort),
 		},
 		Status:   StatusStarting,
 		LastSeen: time.Now(),
@@ -509,10 +531,10 @@ func (a *App) setupAndRegister() error {
 	return a.startRegistration(serviceName, node)
 }
 
-func basicAuthMiddleware(password string, next http.Handler) http.Handler {
+func (a *App) basicAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, providedPassword, ok := r.BasicAuth()
-		if !ok || providedPassword != password {
+		if !ok || providedPassword != a.config.Password {
 			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
