@@ -275,6 +275,7 @@ func (a *App) setupEtcdGroup(serviceName string) error {
 				return false, fmt.Errorf("rate limit exceeded: %w", err)
 			}
 
+			logger.Log.Infof("Creating/joining service group: %s", serviceName)
 			group, err := a.registry.CreateOrJoinServiceGroup(a.ctx, serviceName)
 			if err != nil {
 				return false, fmt.Errorf("failed to create/join service group: %w", err)
