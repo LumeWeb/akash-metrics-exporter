@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/cenkalti/backoff/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.lumeweb.com/akash-metrics-exporter/pkg/build"
@@ -27,10 +26,10 @@ import (
 
 const (
 	defaultPort         = 8080
-	defaultEtcdTimeout  = 5 * time.Minute
-	registrationTTL     = 3 * time.Minute
+	defaultEtcdTimeout  = 10 * time.Minute // Increased timeout to reduce connection churn
+	registrationTTL     = 5 * time.Minute  // Increased TTL to reduce lease operations
 	shutdownTimeout     = 30 * time.Second
-	healthCheckInterval = 90 * time.Second
+	healthCheckInterval = 3 * time.Minute // Reduced health check frequency
 
 	// Metric names
 	metricRegistrationStatus = "node_registration_status"
@@ -72,7 +71,7 @@ func NewApp() *App {
 	app := &App{
 		ctx:         ctx,
 		cancel:      cancel,
-		etcdLimiter: rate.NewLimiter(rate.Every(30*time.Second), 1), // Much more conservative rate limiting
+		etcdLimiter: rate.NewLimiter(rate.Every(60*time.Second), 1), // Much more conservative rate limiting
 
 		// Initialize metrics
 		regStatus: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -222,104 +221,44 @@ func (a *App) updateNodeStatus(status string) error {
 }
 
 func (a *App) registerNode(ctx context.Context, node types.Node) error {
-	_, err := util.RetryOperation(
-		func() (bool, error) {
-			if err := a.validateNodeInfo(node); err != nil {
-				return false, backoff.Permanent(fmt.Errorf("invalid node info: %w", err))
-			}
+	if err := a.validateNodeInfo(node); err != nil {
+		return fmt.Errorf("invalid node info: %w", err)
+	}
 
-			if err := a.etcdLimiter.Wait(ctx); err != nil {
-				return false, err
-			}
+	// Rate limit registration attempts
+	if err := a.etcdLimiter.Wait(ctx); err != nil {
+		return fmt.Errorf("rate limit exceeded: %w", err)
+	}
 
-			done, errChan, err := a.group.RegisterNode(ctx, node, registrationTTL)
-			if err != nil {
-				return false, err
-			}
+	// Register without cleanup on failure
+	done, errChan, err := a.group.RegisterNode(ctx, node, registrationTTL)
+	if err != nil {
+		return fmt.Errorf("registration failed: %w", err)
+	}
 
-			select {
-			case <-done:
-				return true, nil
-			case err := <-errChan:
-				return false, err
-			case <-ctx.Done():
-				return false, ctx.Err()
-			}
-		},
-		util.RegistrationRetry,
-		uint(3),
-	)
-	return err
+	a.regDone = done
+	a.regErrChan = errChan
+	return nil
 }
 
 func (a *App) startHealthCheck() {
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-
-		// Create ticker for LastSeen updates
-		updateTicker := time.NewTicker(1 * time.Minute)
-		defer updateTicker.Stop()
-
-		// Monitor the registration channels
-		for {
-			select {
-			case <-updateTicker.C:
-				// Update LastSeen timestamp periodically
-				if err := a.updateNodeStatus(a.currentNode.Status); err != nil {
-					logger.Log.Errorf("Failed to update LastSeen: %v", err)
-				}
-
-			case <-a.regDone:
-				// Registration expired/completed, need to re-register
-				if err := a.updateNodeStatus(StatusHealthy); err != nil {
-					logger.Log.Errorf("Re-registration failed: %v", err)
-					a.regErrors.Inc()
-					// Try to mark as degraded
-					if err := a.updateNodeStatus(StatusDegraded); err != nil {
-						logger.Log.Errorf("Failed to update degraded status: %v", err)
-					}
-				}
-			case err := <-a.regErrChan:
-				logger.Log.Errorf("Registration error: %v", err)
-				a.regStatus.Set(0)
-				a.regErrors.Inc()
-				// Attempt to re-register after error with backoff
-				time.Sleep(5 * time.Second)
-				if err := a.registerNode(a.ctx, a.currentNode); err != nil {
-					logger.Log.Errorf("Re-registration failed: %v", err)
-				}
-			case <-a.ctx.Done():
-				return
-			}
-		}
-	}()
+	// Health check disabled to reduce lease operations
+	logger.Log.Info("Health check disabled - relying on TTL for status management")
 }
 
 func (a *App) handleRegistrationFailure() error {
-	logger.Log.Warn("Attempting registration recovery")
+	logger.Log.Warn("Registration failed - will retry with backoff")
+	a.regErrors.Inc()
 
-	operation := func() error {
-		// Rate limit etcd operations
-		if err := a.etcdLimiter.Wait(a.ctx); err != nil {
-			return fmt.Errorf("rate limit exceeded: %w", err)
-		}
-
-		if err := a.setupEtcdGroup(a.currentNode.Labels["service"]); err != nil {
-			a.regErrors.Inc()
-			return fmt.Errorf("group setup failed: %w", err)
-		}
-
-		if err := a.updateNodeStatus(StatusDegraded); err != nil {
-			return fmt.Errorf("registration failed: %w", err)
-		}
-		return nil
-	}
-
+	// Simple retry without cleanup
 	_, err := util.RetryOperation(
 		func() (bool, error) {
-			if err := operation(); err != nil {
-				return false, err
+			if err := a.etcdLimiter.Wait(a.ctx); err != nil {
+				return false, fmt.Errorf("rate limit exceeded: %w", err)
+			}
+
+			if err := a.updateNodeStatus(StatusDegraded); err != nil {
+				return false, fmt.Errorf("status update failed: %w", err)
 			}
 			return true, nil
 		},
@@ -380,9 +319,6 @@ func (a *App) startRegistration(serviceName string, node types.Node) error {
 		return fmt.Errorf("initial registration failed: %w", err)
 	}
 
-	// Start health check which handles registration
-	a.startHealthCheck()
-
 	return nil
 }
 
@@ -417,62 +353,35 @@ func (a *App) setupHTTP(metricsPassword string) error {
 func (a *App) shutdown() {
 	logger.Log.Info("Starting graceful shutdown")
 
-	// Update status before shutdown
-	if err := a.updateNodeStatus(StatusShutdown); err != nil {
-		logger.Log.Errorf("Failed to update shutdown status: %v", err)
-	}
-
-	// Cancel context to stop registration and health checks
 	if a.cancel != nil {
 		a.cancel()
-		logger.Log.Debug("Cancelled context")
 	}
 
-	// Create shutdown context
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer shutdownCancel()
-
-	// Shutdown HTTP server first
+	// Close HTTP server first
 	if a.httpServer != nil {
-		logger.Log.Debug("Shutting down HTTP server")
-		if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
-			logger.Log.Errorf("HTTP server shutdown error: %v", err)
-		} else {
-			logger.Log.Debug("HTTP server shutdown complete")
+		if err := a.httpServer.Close(); err != nil {
+			logger.Log.Errorf("HTTP server close error: %v", err)
 		}
 	}
 
-	// Close etcd registry with lease handling
+	// Simply close registry without cleanup
 	if a.registry != nil {
-		logger.Log.Debug("Closing etcd registry")
-		// Ignore lease not found errors during shutdown
-		if err := a.registry.Close(); err != nil {
-			if strings.Contains(err.Error(), "requested lease not found") {
-				logger.Log.Debug("Ignoring lease not found error during shutdown")
-			} else {
-				logger.Log.Errorf("Error closing etcd registry: %v", err)
-			}
-		} else {
-			logger.Log.Debug("Etcd registry closed successfully")
-		}
+		a.registry.Close()
 	}
 
-	// Wait for all goroutines with timeout
-	logger.Log.Debug("Waiting for goroutines to complete")
-	done := make(chan struct{})
+	// Wait for goroutines with short timeout
+	waitCh := make(chan struct{})
 	go func() {
 		a.wg.Wait()
-		close(done)
+		close(waitCh)
 	}()
 
 	select {
-	case <-done:
-		logger.Log.Info("All goroutines completed")
-	case <-shutdownCtx.Done():
+	case <-waitCh:
+		logger.Log.Info("Clean shutdown completed")
+	case <-time.After(5 * time.Second):
 		logger.Log.Warn("Shutdown timed out waiting for goroutines")
 	}
-
-	logger.Log.Info("Shutdown complete")
 }
 
 func main() {

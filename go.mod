@@ -8,7 +8,7 @@ require (
 	github.com/prometheus/client_golang v1.20.5
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.10.0
-	go.lumeweb.com/etcd-registry v0.0.0-20241229091535-9b663af0fe89
+	go.lumeweb.com/etcd-registry v0.0.0-20241229093913-ecba6ccd747a
 	golang.org/x/time v0.8.0
 )
 
