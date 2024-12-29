@@ -26,10 +26,10 @@ import (
 
 const (
 	defaultPort         = 8080
-	defaultEtcdTimeout  = 10 * time.Minute // Increased timeout to reduce connection churn
-	registrationTTL     = 15 * time.Minute // Further increased TTL to reduce lease operations
+	defaultEtcdTimeout  = 10 * time.Minute // Increased timeout for stability
+	registrationTTL     = 15 * time.Minute // Increased TTL to reduce lease operations
 	shutdownTimeout     = 30 * time.Second
-	healthCheckInterval = 3 * time.Minute  // Reduced health check frequency
+	healthCheckInterval = 3 * time.Minute  // Reduced frequency to minimize overhead
 
 	// Metric names
 	metricRegistrationStatus = "node_registration_status"
@@ -71,7 +71,7 @@ func NewApp() *App {
 	app := &App{
 		ctx:         ctx,
 		cancel:      cancel,
-		etcdLimiter: rate.NewLimiter(rate.Every(60*time.Second), 1), // Much more conservative rate limiting
+		etcdLimiter: rate.NewLimiter(rate.Every(5*time.Second), 3), // More balanced rate limiting
 
 		// Initialize metrics
 		regStatus: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -226,9 +226,15 @@ func (a *App) registerNode(ctx context.Context, node types.Node) error {
 	}
 
 	// Rate limit registration attempts
-	if err := a.etcdLimiter.Wait(ctx); err != nil {
-		return fmt.Errorf("rate limit exceeded: %w", err)
+	logger.Log.Debug("Checking registration rate limit")
+	reservation := a.etcdLimiter.Reserve()
+	if !reservation.OK() {
+		logger.Log.Debug("Rate limit would exceed, waiting...")
+		if err := a.etcdLimiter.Wait(ctx); err != nil {
+			return fmt.Errorf("rate limit exceeded: %w", err)
+		}
 	}
+	logger.Log.Debug("Rate limit check passed")
 
 	// Register without cleanup on failure
 	done, errChan, err := a.group.RegisterNode(ctx, node, registrationTTL)
