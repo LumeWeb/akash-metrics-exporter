@@ -8,7 +8,10 @@ import (
 )
 
 func TestNewSystemMetrics(t *testing.T) {
-	metrics := NewSystemMetrics()
+	cfg := &config.Config{
+		NetworkMonitorInterval: time.Second,
+	}
+	metrics := NewSystemMetrics(cfg)
 	assert.NotNil(t, metrics.cpuUsage)
 	assert.NotNil(t, metrics.memUsage)
 	assert.NotNil(t, metrics.ioReadBytes)
@@ -23,7 +26,10 @@ func TestNewSystemMetrics(t *testing.T) {
 }
 
 func TestDescribe(t *testing.T) {
-	metrics := NewSystemMetrics()
+	cfg := &config.Config{
+		NetworkMonitorInterval: time.Second,
+	}
+	metrics := NewSystemMetrics(cfg)
 	ch := make(chan *prometheus.Desc)
 	go func() {
 		metrics.Describe(ch)
@@ -47,7 +53,10 @@ func TestDescribe(t *testing.T) {
 }
 
 func TestCollect(t *testing.T) {
-	metrics := NewSystemMetrics()
+	cfg := &config.Config{
+		NetworkMonitorInterval: time.Second,
+	}
+	metrics := NewSystemMetrics(cfg)
 	ch := make(chan prometheus.Metric)
 	go func() {
 		metrics.Collect(ch)
@@ -62,8 +71,8 @@ func TestReadProcStats(t *testing.T) {
 	// Create temporary test files
 	tmpDir := t.TempDir()
 
-	// Test successful case
-	err := os.WriteFile(tmpDir+"/stat", []byte("cpu  1234 2345 3456 4567 5678 6789 7890 8901\n"), 0644)
+	// Test successful case with mock data
+	err := os.WriteFile(tmpDir+"/stat", []byte("cpu  1234 2345 3456 4567 5678 6789 7890 8901\ncpu0 1234 2345 3456 4567\n"), 0644)
 	assert.NoError(t, err)
 
 	err = os.WriteFile(tmpDir+"/meminfo", []byte("MemTotal:     1024 kB\n"), 0644)

@@ -27,10 +27,9 @@ import (
 
 const (
 	defaultPort         = 8080
-	defaultEtcdTimeout  = 10 * time.Minute // Increased timeout for stability
-	registrationTTL     = 15 * time.Minute // Increased TTL to reduce lease operations
+	defaultEtcdTimeout  = 10 * time.Minute
 	shutdownTimeout     = 30 * time.Second
-	healthCheckInterval = 3 * time.Minute // Reduced frequency to minimize overhead
+	healthCheckInterval = 3 * time.Minute
 
 	// Metric names
 	metricRegistrationStatus = "node_registration_status"
@@ -210,7 +209,7 @@ func (a *App) updateNodeStatus(status string) error {
 				a.regStatus.Set(0)
 			}
 
-			done, errChan, err := a.group.RegisterNode(a.ctx, a.currentNode, registrationTTL)
+			done, errChan, err := a.group.RegisterNode(a.ctx, a.currentNode, a.config.RegistrationTTL)
 			if err != nil {
 				return false, fmt.Errorf("failed to update node status: %w", err)
 			}
@@ -242,7 +241,7 @@ func (a *App) registerNode(ctx context.Context, node types.Node) error {
 	logger.Log.Debug("Rate limit check passed")
 
 	// Register without cleanup on failure
-	done, errChan, err := a.group.RegisterNode(ctx, node, registrationTTL)
+	done, errChan, err := a.group.RegisterNode(ctx, node, a.config.RegistrationTTL)
 	if err != nil {
 		return fmt.Errorf("registration failed: %w", err)
 	}
@@ -434,7 +433,7 @@ func runApp() error {
 	}
 
 	// Configure Prometheus metrics
-	systemMetrics := metrics.NewSystemMetrics()
+	systemMetrics := metrics.NewSystemMetrics(cfg)
 	prometheus.MustRegister(systemMetrics)
 
 	// Start HTTP server
@@ -497,16 +496,13 @@ func (a *App) setupAndRegister() error {
 	cfg.Password = cfg.Password
 	cfg.ServiceName = serviceName
 
-	address := fmt.Sprintf("http://%s:%d%s",
-		cfg.TargetHost,
-		cfg.GetEffectivePort(),
-		cfg.TargetPath)
+	address := cfg.GetAddress()
 
 	identifiers := getNodeIdentifiers(cfg.TargetHost)
 
 	node := types.Node{
 		ID:           identifiers.HashID,
-		ExporterType: "node_exporter",
+		ExporterType: cfg.ExporterType,
 		Port:         cfg.GetEffectivePort(),
 		MetricsPath:  cfg.TargetPath,
 		Labels: map[string]string{

@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"github.com/containerd/cgroups/v3/cgroup2"
 	"github.com/prometheus/client_golang/prometheus"
-	"go.lumeweb.com/akash-metrics-exporter/pkg/metrics/validation"
+	"go.lumeweb.com/akash-metrics-exporter/pkg/config"
 	"go.lumeweb.com/akash-metrics-exporter/pkg/logger"
+	"go.lumeweb.com/akash-metrics-exporter/pkg/metrics/validation"
 	"os"
 	"strconv"
 	"strings"
-	"time"
 )
 
 type SystemMetrics struct {
@@ -27,7 +27,7 @@ type SystemMetrics struct {
 	networkMonitor    *NetworkMonitor
 }
 
-func NewSystemMetrics() *SystemMetrics {
+func NewSystemMetrics(cfg *config.Config) *SystemMetrics {
 	return &SystemMetrics{
 		cpuUsage: prometheus.NewDesc(
 			"system_cpu_usage_percent",
@@ -79,7 +79,7 @@ func NewSystemMetrics() *SystemMetrics {
 			"Network transmit packets per second",
 			[]string{"interface"}, nil,
 		),
-		networkMonitor: NewNetworkMonitor(1 * time.Second),
+		networkMonitor: NewNetworkMonitor(cfg.NetworkMonitorInterval),
 	}
 }
 
@@ -209,7 +209,7 @@ func (m *SystemMetrics) Collect(ch chan<- prometheus.Metric) {
 
 	// Load cgroup controller with proper path and error handling
 	logger.Log.Debug("Loading cgroup2 controller")
-	
+
 	// Get current cgroup path from /proc/self/cgroup
 	selfCgroup, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
@@ -287,7 +287,7 @@ func (m *SystemMetrics) Collect(ch chan<- prometheus.Metric) {
 			totalRios += float64(entry.Rios)
 			totalWios += float64(entry.Wios)
 		}
-		
+
 		ch <- prometheus.MustNewConstMetric(
 			m.ioReadBytes,
 			prometheus.CounterValue,
