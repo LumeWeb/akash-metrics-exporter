@@ -27,10 +27,10 @@ import (
 
 const (
 	defaultPort         = 8080
-	defaultEtcdTimeout  = 120 * time.Second
-	registrationTTL     = 90 * time.Second
-	shutdownTimeout     = 10 * time.Second
-	healthCheckInterval = 45 * time.Second
+	defaultEtcdTimeout  = 5 * time.Minute
+	registrationTTL     = 3 * time.Minute
+	shutdownTimeout     = 30 * time.Second
+	healthCheckInterval = 90 * time.Second
 
 	// Metric names
 	metricRegistrationStatus = "node_registration_status"
@@ -72,7 +72,7 @@ func NewApp() *App {
 	app := &App{
 		ctx:         ctx,
 		cancel:      cancel,
-		etcdLimiter: rate.NewLimiter(rate.Every(5*time.Second), 3), // Reduce rate further
+		etcdLimiter: rate.NewLimiter(rate.Every(30*time.Second), 1), // Much more conservative rate limiting
 
 		// Initialize metrics
 		regStatus: prometheus.NewGauge(prometheus.GaugeOpts{

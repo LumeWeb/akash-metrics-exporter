@@ -17,30 +17,30 @@ type RetryConfig struct {
 var (
 	// ConnectionRetry is configured for etcd connection attempts
 	ConnectionRetry = RetryConfig{
-		InitialInterval:     2 * time.Second,
-		MaxInterval:         30 * time.Second,
-		RandomizationFactor: 0.2,
+		InitialInterval:     5 * time.Second,
+		MaxInterval:         2 * time.Minute,
+		RandomizationFactor: 0.1,
 	}
 
 	// GroupRetry is configured for etcd group operations
 	GroupRetry = RetryConfig{
-		InitialInterval:     2 * time.Second,
-		MaxInterval:         30 * time.Second,
-		RandomizationFactor: 0.2,
+		InitialInterval:     5 * time.Second,
+		MaxInterval:         2 * time.Minute,
+		RandomizationFactor: 0.1,
 	}
 
 	// StatusRetry is configured for node status updates
 	StatusRetry = RetryConfig{
-		InitialInterval:     1 * time.Second,
-		MaxInterval:         15 * time.Second,
-		RandomizationFactor: 0.2,
+		InitialInterval:     5 * time.Second,
+		MaxInterval:         1 * time.Minute,
+		RandomizationFactor: 0.1,
 	}
 
 	// RegistrationRetry is configured for service registration
 	RegistrationRetry = RetryConfig{
-		InitialInterval:     2 * time.Second,
-		MaxInterval:         2 * time.Minute,
-		RandomizationFactor: 0.2,
+		InitialInterval:     10 * time.Second,
+		MaxInterval:         5 * time.Minute,
+		RandomizationFactor: 0.1,
 	}
 )
 
